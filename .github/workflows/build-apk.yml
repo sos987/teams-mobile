@@ -22,8 +22,14 @@ jobs:
       run: |
         npm install
 
-    - name: Sync Capacitor Changes
+    - name: Ensure Android Platform Exists and Sync
       run: |
+        # Проверяем, существует ли папка android. Если нет — инициализируем и создаем её с нуля.
+        if [ ! -d "android" ]; then
+          echo "Папка android отсутствует. Инициализируем платформу..."
+          npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www --no-interactive
+          npx cap add android
+        fi
         npx cap sync android
 
     - name: Set up Java Environment

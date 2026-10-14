@@ -101,6 +101,39 @@ jobs:
                 "  return true;" +
                 "})()";
 
+            // TEMPORARY diagnostics: shows an overlay with what the page can see (tap it to dismiss).
+            private static final boolean DIAG = true;
+            private static final String DIAG_JS =
+                "(async function(){" +
+                "  var out=[];function add(k,v){out.push(k+': '+v);}" +
+                "  try{" +
+                "    add('url',location.host);" +
+                "    add('secureContext',window.isSecureContext);" +
+                "    add('UA',navigator.userAgent.slice(0,70));" +
+                "    var u=navigator.userAgentData;" +
+                "    add('UA-CH',u?JSON.stringify({mobile:u.mobile,platform:u.platform,brands:u.brands.map(function(b){return b.brand;})}):'none');" +
+                "    add('platform/touch',navigator.platform+' / '+navigator.maxTouchPoints);" +
+                "    add('mediaDevices',!!navigator.mediaDevices);" +
+                "    add('RTCPeerConnection',typeof RTCPeerConnection);" +
+                "    for (const n of ['microphone','camera']) {" +
+                "      try{var r=await navigator.permissions.query({name:n});add('permission '+n,r.state);}catch(e){add('permission '+n,'ERR '+e.name);}" +
+                "    }" +
+                "    function fmt(d){return d.map(function(x){return x.kind+(x.label?'':'(nolabel)');}).join(', ')||'none';}" +
+                "    add('devices before',fmt(await navigator.mediaDevices.enumerateDevices()));" +
+                "    for (const c of [{audio:true},{video:true}]) {" +
+                "      try{var s=await navigator.mediaDevices.getUserMedia(c);s.getTracks().forEach(function(t){t.stop();});add('getUserMedia '+Object.keys(c)[0],'OK');}" +
+                "      catch(e){add('getUserMedia '+Object.keys(c)[0],e.name+': '+e.message);}" +
+                "    }" +
+                "    add('devices after',fmt(await navigator.mediaDevices.enumerateDevices()));" +
+                "  }catch(e){add('FATAL',e.name+': '+e.message);}" +
+                "  var old=document.getElementById('diag-overlay');if(old)old.remove();" +
+                "  var p=document.createElement('pre');p.id='diag-overlay';" +
+                "  p.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647;background:rgba(0,0,0,.88);color:#0f0;font:11px monospace;padding:8px;margin:0;white-space:pre-wrap;';" +
+                "  p.textContent=out.join('\\n')+'\\n(tap to dismiss)';" +
+                "  p.onclick=function(){p.remove();};" +
+                "  document.body.appendChild(p);" +
+                "})();";
+
             private boolean canGoBackWithinTeams(WebView wv) {
                 WebBackForwardList list = wv.copyBackForwardList();
                 int idx = list.getCurrentIndex();
@@ -165,6 +198,7 @@ jobs:
                                 if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) needCamera = true;
                                 if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) needMic = true;
                             }
+                            Log.d("TeamsMobile", "onPermissionRequest origin=" + request.getOrigin() + " camera=" + needCamera + " mic=" + needMic);
                             boolean ok = (!needCamera || has(Manifest.permission.CAMERA))
                                     && (!needMic || has(Manifest.permission.RECORD_AUDIO));
                             if (ok) {
@@ -272,6 +306,17 @@ jobs:
                                     webView.evaluateJavascript(heavyCSSInjection, null);
                                 }
                             }, i * 1500);
+                        }
+
+                        if (DIAG) {
+                            for (int delay : new int[]{15000, 45000}) {
+                                handler.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        webView.evaluateJavascript(DIAG_JS, null);
+                                    }
+                                }, delay);
+                            }
                         }
                     }
                 });

@@ -72,6 +72,7 @@ jobs:
         import android.webkit.WebBackForwardList;
         import android.webkit.WebSettings;
         import android.webkit.WebView;
+        import android.widget.Toast;
         import androidx.activity.OnBackPressedCallback;
         import androidx.core.app.ActivityCompat;
         import androidx.core.content.ContextCompat;
@@ -102,7 +103,7 @@ jobs:
                 "})()";
 
             // TEMPORARY diagnostics: shows an overlay with what the page can see (tap it to dismiss).
-            private static final boolean DIAG = true;
+            private static final boolean DIAG = false;
             private static final String DIAG_JS =
                 "(async function(){" +
                 "  var out=[];function add(k,v){out.push(k+': '+v);}" +
@@ -132,6 +133,43 @@ jobs:
                 "  p.textContent=out.join('\\n')+'\\n(tap to dismiss)';" +
                 "  p.onclick=function(){p.remove();};" +
                 "  document.body.appendChild(p);" +
+                "})();";
+
+            // TEMPORARY: records what Teams itself asks the browser for (getUserMedia / enumerateDevices / permissions)
+            // and shows the last events in a yellow strip at the bottom of the screen (taps pass through it).
+            private static final String MEDIA_TRACE_JS =
+                "(function(){" +
+                "  var md=navigator.mediaDevices; if(!md||window.__mediaWrapped) return; window.__mediaWrapped=true;" +
+                "  var log=[];" +
+                "  function show(){" +
+                "    var p=document.getElementById('media-log');" +
+                "    if(!p){p=document.createElement('pre');p.id='media-log';" +
+                "      p.style.cssText='position:fixed;bottom:0;left:0;right:0;z-index:2147483647;background:rgba(0,0,0,.85);color:#ff0;font:10px monospace;padding:6px;margin:0;white-space:pre-wrap;max-height:38%;overflow:hidden;pointer-events:none;';" +
+                "      document.body.appendChild(p);}" +
+                "    p.textContent=log.slice(-9).join('\\n');" +
+                "  }" +
+                "  var ogum=md.getUserMedia.bind(md);" +
+                "  md.getUserMedia=function(c){" +
+                "    log.push('gUM '+JSON.stringify(c).slice(0,140));show();" +
+                "    return ogum(c).then(function(s){log.push('  OK '+s.getTracks().map(function(t){return t.kind+':'+t.readyState;}).join(','));show();return s;}," +
+                "      function(e){log.push('  ERR '+e.name+': '+e.message);show();throw e;});" +
+                "  };" +
+                "  var oenum=md.enumerateDevices.bind(md);" +
+                "  md.enumerateDevices=function(){" +
+                "    return oenum().then(function(d){log.push('enum '+d.map(function(x){return x.kind.slice(0,2)+(x.deviceId?'':'!id')+(x.label?'':'!lbl');}).join(' '));show();return d;});" +
+                "  };" +
+                "  if(navigator.permissions&&navigator.permissions.query){" +
+                "    var oq=navigator.permissions.query.bind(navigator.permissions);" +
+                "    navigator.permissions.query=function(d){" +
+                "      return oq(d).then(function(r){log.push('perm '+d.name+'='+r.state);show();return r;}," +
+                "        function(e){log.push('perm '+d.name+' ERR '+e.name);show();throw e;});" +
+                "    };" +
+                "  }" +
+                "  window.addEventListener('unhandledrejection',function(ev){" +
+                "    var r=ev.reason||{}; var t=(r.name||'')+' '+(r.message||r);" +
+                "    if(/NotAllowed|NotFound|Overconstrained|NotReadable|Permission|device/i.test(t)){log.push('REJECT '+String(t).slice(0,120));show();}" +
+                "  });" +
+                "  log.push('trace on');show();" +
                 "})();";
 
             private boolean canGoBackWithinTeams(WebView wv) {
@@ -201,6 +239,7 @@ jobs:
                             Log.d("TeamsMobile", "onPermissionRequest origin=" + request.getOrigin() + " camera=" + needCamera + " mic=" + needMic);
                             boolean ok = (!needCamera || has(Manifest.permission.CAMERA))
                                     && (!needMic || has(Manifest.permission.RECORD_AUDIO));
+                            Toast.makeText(MainActivity.this, "perm req " + request.getOrigin() + " cam=" + needCamera + " mic=" + needMic + " held=" + ok, Toast.LENGTH_SHORT).show();
                             if (ok) {
                                 request.grant(request.getResources());
                             } else if (permissionRequestInFlight) {
@@ -307,6 +346,16 @@ jobs:
                                 }
                             }, i * 1500);
                         }
+
+                        // Re-inject the (idempotent) media trace every 3 s so it survives page reloads/redirects
+                        final Runnable traceTick = new Runnable() {
+                            @Override
+                            public void run() {
+                                webView.evaluateJavascript(MEDIA_TRACE_JS, null);
+                                handler.postDelayed(this, 3000);
+                            }
+                        };
+                        handler.postDelayed(traceTick, 1000);
 
                         if (DIAG) {
                             for (int delay : new int[]{15000, 45000}) {

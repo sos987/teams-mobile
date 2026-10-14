@@ -37,6 +37,7 @@ jobs:
         # 4. Generate the complete android platform directory framework including gradlew files
         npx cap add android
         npx cap sync android
+
     - name: Add Camera / Microphone / Audio Permissions to AndroidManifest
       run: |
         MANIFEST=android/app/src/main/AndroidManifest.xml

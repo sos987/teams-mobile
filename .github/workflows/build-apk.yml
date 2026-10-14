@@ -63,6 +63,7 @@ jobs:
         import android.os.Bundle;
         import android.os.Handler;
         import android.os.Looper;
+        import android.util.Log;
         import android.view.View;
         import android.view.WindowManager;
         import android.webkit.CookieManager;
@@ -130,6 +131,7 @@ jobs:
             };
 
             private void persistSessionCookies() {
+                try {
                 CookieManager cm = CookieManager.getInstance();
                 for (String host : COOKIE_HOSTS) {
                     String url = "https://" + host + "/";
@@ -144,6 +146,39 @@ jobs:
                     }
                 }
                 cm.flush();
+                } catch (Throwable t) {
+                    Log.e("TeamsMobile", "persistSessionCookies failed", t);
+                }
+            }
+
+            // IMPORTANT: BridgeWebChromeClient registers ActivityResult launchers in its constructor, which Android only
+            // allows before the activity is STARTED. So this must run inside onCreate, not in a delayed post().
+            private void installMediaPermissionClient() {
+                try {
+                    final WebView webView = bridge.getWebView();
+                    webView.setWebChromeClient(new BridgeWebChromeClient(bridge) {
+                        @Override
+                        public void onPermissionRequest(final PermissionRequest request) {
+                            // WebView calls this on the UI thread already
+                            boolean needCamera = false, needMic = false;
+                            for (String r : request.getResources()) {
+                                if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) needCamera = true;
+                                if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) needMic = true;
+                            }
+                            boolean ok = (!needCamera || has(Manifest.permission.CAMERA))
+                                    && (!needMic || has(Manifest.permission.RECORD_AUDIO));
+                            if (ok) {
+                                request.grant(request.getResources());
+                            } else if (permissionRequestInFlight) {
+                                request.deny(); // system dialog already showing; page is reloaded after the answer
+                            } else {
+                                super.onPermissionRequest(request); // Capacitor's own prompt flow
+                            }
+                        }
+                    });
+                } catch (Throwable t) {
+                    Log.e("TeamsMobile", "Could not install media permission client", t);
+                }
             }
 
             private boolean has(String permission) {
@@ -177,6 +212,8 @@ jobs:
                     ActivityCompat.requestPermissions(this, missing.toArray(new String[0]), MEDIA_PERMISSION_REQUEST);
                 }
 
+                installMediaPermissionClient();
+
                 // TEMPORARY: allows chrome://inspect on the phone to debug Teams. Remove once media works.
                 WebView.setWebContentsDebuggingEnabled(true);
 
@@ -185,28 +222,6 @@ jobs:
                     public void run() {
                         final WebView webView = bridge.getWebView();
                         WebSettings settings = webView.getSettings();
-
-                        // Keep Capacitor's own WebChromeClient (file chooser etc.), only change media permission handling
-                        webView.setWebChromeClient(new BridgeWebChromeClient(bridge) {
-                            @Override
-                            public void onPermissionRequest(final PermissionRequest request) {
-                                // WebView calls this on the UI thread already
-                                boolean needCamera = false, needMic = false;
-                                for (String r : request.getResources()) {
-                                    if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) needCamera = true;
-                                    if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) needMic = true;
-                                }
-                                boolean ok = (!needCamera || has(Manifest.permission.CAMERA))
-                                        && (!needMic || has(Manifest.permission.RECORD_AUDIO));
-                                if (ok) {
-                                    request.grant(request.getResources());
-                                } else if (permissionRequestInFlight) {
-                                    request.deny(); // system dialog already showing; page is reloaded after the answer
-                                } else {
-                                    super.onPermissionRequest(request); // Capacitor's own prompt flow
-                                }
-                            }
-                        });
 
                         String desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
                         settings.setUserAgentString(desktopUA);
@@ -277,7 +292,7 @@ jobs:
             @Override
             public void onPause() {
                 super.onPause();
-                persistSessionCookies();
+                CookieManager.getInstance().flush();
             }
 
             @Override

@@ -10,7 +10,8 @@
       "://microsoftonline.com",
       "*.microsoft.com",
       "*.microsoftonline.com",
-      "*.live.com"
+      "*.live.com",
+      "*.mcas.ms"
     ]
   },
   "android": {

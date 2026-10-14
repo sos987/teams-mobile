@@ -24,29 +24,24 @@ jobs:
 
     - name: Generate Native Android Project Fresh
       run: |
-        # 1. Clear out any pre-existing broken android folder tracks to prevent collisions
         rm -rf android
-        
-        # 2. Setup the dummy web assets folder required structurally by the engine
         mkdir -p www
         echo '<!DOCTYPE html><html><head><title>Teams</title></head><body>Loading...</body></html>' > www/index.html
-        
-        # 3. Initialize the tool configuration properties mapping
         npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www
-        
-        # 4. Generate the complete android platform directory framework including gradlew files
         npx cap add android
         npx cap sync android
 
     - name: Inject Custom MainActivity Java Code
       run: |
-        # Inject the custom UI header margins logic and persistent session sync rules
         cat << 'EOF' > android/app/src/main/java/com/custom/teamsdesktop/MainActivity.java
         package com.custom.teamsdesktop;
 
         import android.os.Bundle;
         import android.os.Handler;
         import android.os.Looper;
+        import android.view.View;
+        import androidx.core.view.ViewCompat;
+        import androidx.core.view.WindowInsetsCompat;
         import android.webkit.CookieManager;
         import android.webkit.WebSettings;
         import android.webkit.WebView;
@@ -57,6 +52,16 @@ jobs:
             public void onCreate(Bundle savedInstanceState) {
                 super.onCreate(savedInstanceState);
                 
+                // 1. Definitively solve status bar overlap using Native Window Insets padding
+                ViewCompat.setOnApplyWindowInsetsListener(findViewById(android.R.id.content), (v, insets) -> {
+                    int statusBarHeight = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top;
+                    int navigationBarHeight = insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom;
+                    
+                    // Pad the root view container so web layout stays perfectly inside safe screen bounds
+                    v.setPadding(0, statusBarHeight, 0, navigationBarHeight);
+                    return insets;
+                });
+
                 this.bridge.getWebView().post(new Runnable() {
                     @Override
                     public void run() {
@@ -66,6 +71,7 @@ jobs:
                         String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
                         settings.setUserAgentString(desktopUA);
                         
+                        // Enable aggressive persistent cookie storage infrastructure
                         settings.setJavaScriptEnabled(true);
                         settings.setDomStorageEnabled(true);
                         settings.setDatabaseEnabled(true);
@@ -75,6 +81,7 @@ jobs:
                         cookieManager.setAcceptCookie(true);
                         cookieManager.setAcceptThirdPartyCookies(webView, true);
 
+                        // Layout Scaling Adjustments
                         final String heavyCSSInjection = 
                             "(function() {" +
                             "  var id = 'custom-teams-margins';" +
@@ -83,18 +90,10 @@ jobs:
                             "  style.id = id;" +
                             "  style.type = 'text/css';" +
                             "  style.innerHTML = '" +
-                            "    body, html, #app-container, .app-width, #main-layout-id {" +
-                            "      padding-top: 45px !important;" +
-                            "      box-sizing: border-box !important;" +
-                            "    }" +
-                            "    #tou-header-layout, .v2-header, [data-test-id=\"desktop-header\"], div[class*=\"header-container\"] {" +
-                            "      top: 45px !important;" +
-                            "    }" +
+                            "    body, html, #app-container, .app-width, #main-layout-id { zoom: 0.85 !important; }" +
                             "    .v2-left-rail, [data-test-id=\"left-rail\"], div[class*=\"leftRail\"] {" +
-                            "      top: 95px !important;" +
                             "      width: 50px !important; min-width: 50px !important;" +
                             "    }" +
-                            "    body { zoom: 0.85 !important; }" +
                             "    .download-app-banner, .mobile-promo { display: none !important; }" +
                             "  ';" +
                             "  document.head.appendChild(style);" +
@@ -113,10 +112,11 @@ jobs:
                 });
             }
 
+            // 2. Fixed access modifier compilation conflict (changed from protected to public)
             @Override
-            protected void onPause() {
+            public void onPause() {
                 super.onPause();
-                CookieManager.getInstance().flush();
+                CookieManager.getInstance().flush(); // Synchronize login cookies to device disk immediately
             }
         }
         EOF
@@ -143,7 +143,7 @@ jobs:
         keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         keyPassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
 
-    - name: Upload Signed Release APK Artifact
+    - name: Upload Finished APK Artifact
       uses: actions/upload-artifact@v4
       with:
         name: teams-desktop-pwa-release-signed-apk

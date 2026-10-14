@@ -1,5 +1,30 @@
 <!DOCTYPE html>
-<html>
-<head><title>Teams Wrapper</title></head>
-<body>Loading Teams Desktop...</body>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Teams Loader</title>
+    <style>
+        body {
+            background-color: #2f3136;
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: sans-serif;
+            margin: 0;
+        }
+    </style>
+</head>
+<body>
+    <div>Загрузка Microsoft Teams...</div>
+
+    <script>
+        // Даем WebView 200мс на то, чтобы поднять CookieManager и локальные базы данных из памяти устройства
+        setTimeout(function() {
+            window.location.href = "https://microsoft.com";
+        }, 200);
+    </script>
+</body>
 </html>

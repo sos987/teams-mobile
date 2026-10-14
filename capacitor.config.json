@@ -3,7 +3,7 @@
   "appName": "Teams Desktop PWA",
   "webDir": "www",
   "server": {
-    "url": "https://microsoft.com",
+    "url": "https://teams.cloud.microsoft",
     "allowNavigation": ["*"]
   },
   "android": {

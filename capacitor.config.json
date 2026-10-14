@@ -3,9 +3,35 @@
   "appName": "Teams Desktop PWA",
   "webDir": "www",
   "server": {
-    "allowNavigation": ["*"]
+    "url": "https://teams.cloud.microsoft",
+    "allowNavigation": [
+      "://microsoft.com",
+      "teams.cloud.microsoft",
+      "://microsoftonline.com",
+      "*.microsoft.com",
+      "*.microsoftonline.com",
+      "*.live.com",
+      "*.mcas.ms",
+      "*.microsoft",
+      "*.gstatic.com",
+      "*.google.com",
+      "*.gvt2.com",
+      "*.office.net",
+      "*.msftauth.net",
+      "*.live.com",
+      "*.googleapis.com",
+      "*.msftauthimages.net"
+    ]
   },
   "android": {
-    "overrideUserAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+    "overrideUserAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+    "backgroundColor": "#1f1f1f"
+  },
+  "plugins": {
+    "StatusBar": {
+      "overlaysWebView": false,
+      "style": "DARK",
+      "backgroundColor": "#1f1f1f"
+    }
   }
 }

@@ -24,20 +24,23 @@ jobs:
 
     - name: Generate Native Android Project Fresh
       run: |
-        # 1. Создаем заглушку веб-директории, так как Capacitor строго требует её наличие
+        # 1. Clear out any pre-existing broken android folder tracks to prevent collisions
+        rm -rf android
+        
+        # 2. Setup the dummy web assets folder required structurally by the engine
         mkdir -p www
         echo '<!DOCTYPE html><html><head><title>Teams</title></head><body>Loading...</body></html>' > www/index.html
         
-        # 2. Инициализируем конфигурацию приложения в неинтерактивном режиме
+        # 3. Initialize the tool configuration properties mapping
         npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www
         
-        # 3. Генерируем с нуля папку android и файл gradlew
+        # 4. Generate the complete android platform directory framework including gradlew files
         npx cap add android
         npx cap sync android
 
     - name: Inject Custom MainActivity Java Code
       run: |
-        # Записываем наш кастомный Java-код со сдвигом шапки и persistent-куками поверх сгенерированного шаблона
+        # Inject the custom UI header margins logic and persistent session sync rules
         cat << 'EOF' > android/app/src/main/java/com/custom/teamsdesktop/MainActivity.java
         package com.custom.teamsdesktop;
 

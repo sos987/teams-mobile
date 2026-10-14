@@ -1,0 +1,16 @@
+{
+  "name": "teams-desktop-android-pwa",
+  "version": "1.0.0",
+  "description": "Teams Desktop Mode for Android Wrapper",
+  "main": "index.js",
+  "scripts": {
+    "build": "echo 'No web build required'"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/android": "^6.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0"
+  }
+}

@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android Release APK
 
 on:
   push:
@@ -18,21 +18,12 @@ jobs:
       with:
         node-version: 20
 
-    - name: Install & Fix Dependencies
+    - name: Install Dependencies
       run: |
         npm install
-        npm audit fix --force  # Automatically patches the high/critical vulnerabilities
 
-    - name: Sync & Prepare Capacitor Android
+    - name: Sync Capacitor Changes
       run: |
-        # 1. Clear out pre-existing local android directories to prevent collisions
-        rm -rf android
-        
-        # 2. Initialize with non-interactive parameters explicitly passed
-        npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www
-        
-        # 3. Freshly construct the platform wrapper
-        npx cap add android
         npx cap sync android
 
     - name: Set up Java Environment
@@ -41,14 +32,24 @@ jobs:
         distribution: 'zulu'
         java-version: '21'
 
-    - name: Compile and Bundle APK
+    - name: Build Release APK
       run: |
         cd android
         chmod +x gradlew
-        ./gradlew assembleDebug
+        ./gradlew assembleRelease
 
-    - name: Upload Finished APK Artifact
+    - name: Sign Release APK
+      uses: r0adkll/sign-android-release@v1
+      id: sign_app
+      with:
+        releaseDirectory: android/app/build/outputs/apk/release
+        signingKeyBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        alias: ${{ secrets.ANDROID_KEY_ALIAS }}
+        keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        keyPassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+
+    - name: Upload Signed Release APK Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: teams-desktop-pwa-debug-apk
-        path: android/app/build/outputs/apk/debug/app-debug.apk
+        name: teams-desktop-pwa-release-signed-apk
+        path: ${{ steps.sign_app.outputs.signedReleaseFile }}

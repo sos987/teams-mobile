@@ -11,7 +11,16 @@
       "*.microsoft.com",
       "*.microsoftonline.com",
       "*.live.com",
-      "*.mcas.ms"
+      "*.mcas.ms",
+      "*.microsoft",
+      "*.gstatic.com",
+      "*.google.com",
+      "*.gvt2.com",
+      "*.office.net",
+      "*.msftauth.net",
+      "*.live.com",
+      "*.googleapis.com",
+      "*.msftauthimages.net"
     ]
   },
   "android": {

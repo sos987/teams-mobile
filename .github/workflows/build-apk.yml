@@ -24,10 +24,14 @@ jobs:
 
     - name: Ensure Android Platform Exists and Sync
       run: |
-        # Проверяем, существует ли папка android. Если нет — инициализируем и создаем её с нуля.
+        # Если папка www отсутствует, создаем её, так как Capacitor строго требует её наличие при инициализации
+        mkdir -p www
+        touch www/index.html
+        
+        # Проверяем, существует ли папка android. Если нет — генерируем её корректными CLI-командами
         if [ ! -d "android" ]; then
-          echo "Папка android отсутствует. Инициализируем платформу..."
-          npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www --no-interactive
+          echo "Папка android отсутствует. Генерируем нативную платформу..."
+          npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www
           npx cap add android
         fi
         npx cap sync android

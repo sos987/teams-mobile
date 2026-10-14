@@ -37,6 +37,18 @@ jobs:
         # 4. Generate the complete android platform directory framework including gradlew files
         npx cap add android
         npx cap sync android
+    - name: Add Camera / Microphone / Audio Permissions to AndroidManifest
+      run: |
+        MANIFEST=android/app/src/main/AndroidManifest.xml
+ 
+        # Runtime-requestable permissions. Capacitor's WebChromeClient asks the user for
+        # CAMERA / RECORD_AUDIO when Teams calls getUserMedia(), but only if they are declared here.
+        # BLUETOOTH_CONNECT is needed on Android 12+ to route call audio to BT headsets.
+        sed -i 's#</manifest>#    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />\n</manifest>#' "$MANIFEST"
+ 
+        echo "---- Resulting manifest ----"
+        cat "$MANIFEST"
+        grep -q "android.permission.RECORD_AUDIO" "$MANIFEST" || { echo "Manifest patch failed"; exit 1; }
 
     - name: Inject Custom MainActivity Java Code
       run: |
@@ -72,6 +84,8 @@ jobs:
                         settings.setDatabaseEnabled(true);
                         settings.setSavePassword(true);
                         settings.setSaveFormData(true);
+
+                        settings.setMediaPlaybackRequiresUserGesture(false);
                         
                         CookieManager cookieManager = CookieManager.getInstance();
                         cookieManager.setAcceptCookie(true);

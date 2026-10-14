@@ -2,6 +2,8 @@ package com.custom.teamsdesktop;
 
 import android.os.Bundle;
 import android.util.Base64;
+import android.webkit.CookieManager; // Import Cookie Manager
+import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import com.getcapacitor.BridgeActivity;
@@ -11,30 +13,45 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         
-        // Wait for the Capacitor bridge WebView to initialize
-        this.bridge.getWebView().setWebViewClient(new WebViewClient() {
+        this.bridge.getWebView().post(new Runnable() {
             @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
+            public void run() {
+                WebView webView = bridge.getWebView();
+                WebSettings settings = webView.getSettings();
                 
-                // Define your mobile-friendly desktop UI tweaks here
-                String customCSS = "body { zoom: 0.85 !important; }" +
-                                   "[data-test-id='left-rail'], .v2-left-rail { width: 50px !important; min-width: 50px !important; }" +
-                                   ".ts-message-list-item { padding-left: 4px !important; padding-right: 4px !important; }" +
-                                   ".download-app-banner, .mobile-promo { display: none !important; }";
+                // 1. Force state storage persistence parameters
+                settings.setDomStorageEnabled(true);
+                settings.setDatabaseEnabled(true);
+                settings.setSavePassword(true);
                 
-                String encodedCSS = Base64.encodeToString(customCSS.getBytes(), Base64.NO_WRAP);
+                // 2. Instruct the engine to accept and retain session authentication tokens
+                CookieManager cookieManager = CookieManager.getInstance();
+                cookieManager.setAcceptCookie(true);
+                cookieManager.setAcceptThirdPartyCookies(webView, true);
                 
-                // Programmatic injection
-                view.evaluateJavascript(
-                    "(function() {" +
-                    "var parent = document.getElementsByTagName('head').item(0);" +
-                    "var style = document.createElement('style');" +
-                    "style.type = 'text/css';" +
-                    "style.innerHTML = window.atob('" + encodedCSS + "');" +
-                    "parent.appendChild(style);" +
-                    "})();", null
-                );
+                webView.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onPageFinished(WebView view, String url) {
+                        super.onPageFinished(view, url);
+                        
+                        // Inject our updated mobile-friendly styles
+                        String customCSS = "body { zoom: 0.85 !important; }" +
+                                           "[data-test-id='left-rail'], .v2-left-rail { width: 50px !important; min-width: 50px !important; }" +
+                                           ".ts-message-list-item { padding-left: 4px !important; padding-right: 4px !important; }" +
+                                           ".download-app-banner, .mobile-promo { display: none !important; }";
+                        
+                        String encodedCSS = Base64.encodeToString(customCSS.getBytes(), Base64.NO_WRAP);
+                        view.evaluateJavascript(
+                            "(function() {" +
+                            "var parent = document.getElementsByTagName('head').item(0);" +
+                            "var style = document.createElement('style');" +
+                            "style.type = 'text/css';" +
+                            "style.innerHTML = window.atob('" + encodedCSS + "');" +
+                            "parent.appendChild(style);" +
+                            "})();", null
+                        );
+                    }
+                });
             }
         });
     }

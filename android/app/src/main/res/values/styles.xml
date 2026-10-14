@@ -1,0 +1,17 @@
+<resources>
+    <!-- Base application theme -->
+    <style name="AppTheme" parent="Theme.AppCompat.Light.DarkActionBar">
+        <!-- Customize your theme here -->
+        <item name="colorPrimary">#464EB8</item> <!-- Teams Purple -->
+        <item name="colorPrimaryDark">#3B429F</item>
+        <item name="colorAccent">#464EB8</item>
+    </style>
+
+    <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+        <!-- Ensure window layout is NOT bleeding into system elements -->
+        <item name="android:windowFullscreen">false</item>
+        <item name="android:fitsSystemWindows">true</item>
+    </style>
+</resources>

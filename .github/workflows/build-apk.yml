@@ -51,6 +51,135 @@ jobs:
         cat "$MANIFEST"
         grep -q "android.permission.RECORD_AUDIO" "$MANIFEST" || { echo "Manifest patch failed"; exit 1; }
 
+    - name: Add Page Hooks Script and androidx.webkit Dependency
+      run: |
+        # JS that runs at document start in every frame: media/permission hooks + client-hints fix (needs androidx.webkit)
+        mkdir -p android/app/src/main/assets
+        cat << 'JSEOF' > android/app/src/main/assets/page-hooks.js
+        (function () {
+          'use strict';
+          if (window.__teamsHooks) return;
+          window.__teamsHooks = true;
+
+          var IS_TOP = (window === window.top);
+          var FAKE_GRANTED = true;  // report camera/microphone permission as 'granted' (WebView always says 'prompt')
+          var SPOOF_UACH = true;    // make navigator.userAgentData match the desktop Linux Chrome user-agent
+          var SHOW_TRACE = true;    // TEMPORARY yellow debug strip at the bottom of the screen
+
+          function short(s, n) { s = String(s); return s.length > n ? s.slice(0, n) + '..' : s; }
+
+          // ---------- trace strip ----------
+          var lines = [];
+          function render() {
+            if (!IS_TOP || !SHOW_TRACE) return;
+            var host = document.body || document.documentElement;
+            if (!host) return;
+            var p = document.getElementById('media-log');
+            if (!p) {
+              p = document.createElement('pre');
+              p.id = 'media-log';
+              p.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:2147483647;background:rgba(0,0,0,.85);color:#ff0;font:10px monospace;padding:6px;margin:0;white-space:pre-wrap;max-height:38%;overflow:hidden;pointer-events:none;';
+              host.appendChild(p);
+            }
+            p.textContent = lines.slice(-10).join('\n');
+          }
+          function push(line) {
+            if (lines.length && lines[lines.length - 1] === line) return;
+            lines.push(line);
+            render();
+          }
+          function log(msg) {
+            var line = (IS_TOP ? '' : '[' + short(location.host || 'frame', 18) + '] ') + msg;
+            if (IS_TOP) push(line);
+            else { try { window.top.postMessage({ __tlog: line }, '*'); } catch (e) {} }
+          }
+          if (IS_TOP) {
+            window.addEventListener('message', function (ev) {
+              var d = ev.data;
+              if (d && typeof d === 'object' && d.__tlog) push(String(d.__tlog));
+            });
+            document.addEventListener('DOMContentLoaded', render);
+          }
+
+          // ---------- media API hooks (installed on prototypes, so references captured later still go through) ----------
+          try {
+            var MD = window.MediaDevices && window.MediaDevices.prototype;
+            if (MD && MD.getUserMedia) {
+              var ogum = MD.getUserMedia;
+              MD.getUserMedia = function (c) {
+                log('gUM ' + short(JSON.stringify(c), 100));
+                return ogum.apply(this, arguments).then(function (s) {
+                  log('  OK ' + s.getTracks().map(function (t) { return t.kind[0] + ':' + t.readyState; }).join(','));
+                  return s;
+                }, function (e) {
+                  log('  ERR ' + e.name + ': ' + short(e.message, 60));
+                  throw e;
+                });
+              };
+            }
+            if (MD && MD.enumerateDevices) {
+              var oenum = MD.enumerateDevices;
+              MD.enumerateDevices = function () {
+                return oenum.apply(this, arguments).then(function (d) {
+                  log('enum ' + d.map(function (x) { return x.kind.slice(0, 2) + (x.deviceId ? '' : '!id') + (x.label ? '' : '!lbl'); }).join(' '));
+                  return d;
+                });
+              };
+            }
+          } catch (e) {}
+
+          try {
+            var P = window.Permissions && window.Permissions.prototype;
+            if (P && P.query) {
+              var oq = P.query;
+              P.query = function (d) {
+                var name = d && d.name;
+                var media = (name === 'microphone' || name === 'camera');
+                return oq.apply(this, arguments).then(function (r) {
+                  var real = r.state;
+                  if (FAKE_GRANTED && media) {
+                    try { Object.defineProperty(r, 'state', { get: function () { return 'granted'; } }); } catch (e) {}
+                  }
+                  log('perm ' + name + '=' + real + (FAKE_GRANTED && media ? '->granted' : ''));
+                  return r;
+                }, function (e) {
+                  log('perm ' + name + ' ERR ' + e.name);
+                  throw e;
+                });
+              };
+            }
+          } catch (e) {}
+
+          window.addEventListener('unhandledrejection', function (ev) {
+            var r = ev.reason || {};
+            var t = (r.name || '') + ' ' + (r.message || r);
+            if (/NotAllowed|NotFound|Overconstrained|NotReadable|Permission|device/i.test(t)) log('REJECT ' + short(t, 100));
+          });
+
+          // ---------- client hints: stop advertising "Android WebView / mobile" to page scripts ----------
+          if (SPOOF_UACH) {
+            try {
+              var brands = [{ brand: 'Chromium', version: '155' }, { brand: 'Google Chrome', version: '155' }, { brand: 'Not A(Brand)', version: '99' }];
+              var full = [{ brand: 'Chromium', version: '155.0.0.0' }, { brand: 'Google Chrome', version: '155.0.0.0' }, { brand: 'Not A(Brand)', version: '99.0.0.0' }];
+              var uad = {
+                brands: brands, mobile: false, platform: 'Linux',
+                getHighEntropyValues: function () {
+                  return Promise.resolve({ brands: brands, mobile: false, platform: 'Linux', platformVersion: '6.5.0', architecture: 'x86', bitness: '64', model: '', uaFullVersion: '155.0.0.0', fullVersionList: full, wow64: false });
+                },
+                toJSON: function () { return { brands: brands, mobile: false, platform: 'Linux' }; }
+              };
+              Object.defineProperty(Navigator.prototype, 'userAgentData', { get: function () { return uad; }, configurable: true });
+            } catch (e) {}
+          }
+
+          log('hooks on (' + (IS_TOP ? 'top' : 'frame') + ')');
+        })();
+        JSEOF
+
+        GRADLE=android/app/build.gradle
+        sed -i '0,/^dependencies {/s//dependencies {\n    implementation "androidx.webkit:webkit:1.12.1"/' "$GRADLE"
+        grep -n "androidx.webkit" "$GRADLE" || { echo "Could not add androidx.webkit dependency"; exit 1; }
+
     - name: Inject Custom MainActivity Java Code
       run: |
         # Inject the custom UI header margins logic and persistent session sync rules with Linux User-Agent
@@ -76,9 +205,14 @@ jobs:
         import androidx.activity.OnBackPressedCallback;
         import androidx.core.app.ActivityCompat;
         import androidx.core.content.ContextCompat;
+        import androidx.webkit.WebViewCompat;
+        import androidx.webkit.WebViewFeature;
         import com.getcapacitor.BridgeActivity;
         import com.getcapacitor.BridgeWebChromeClient;
+        import java.io.ByteArrayOutputStream;
+        import java.io.InputStream;
         import java.util.ArrayList;
+        import java.util.Collections;
         import java.util.List;
 
         public class MainActivity extends BridgeActivity {
@@ -133,43 +267,6 @@ jobs:
                 "  p.textContent=out.join('\\n')+'\\n(tap to dismiss)';" +
                 "  p.onclick=function(){p.remove();};" +
                 "  document.body.appendChild(p);" +
-                "})();";
-
-            // TEMPORARY: records what Teams itself asks the browser for (getUserMedia / enumerateDevices / permissions)
-            // and shows the last events in a yellow strip at the bottom of the screen (taps pass through it).
-            private static final String MEDIA_TRACE_JS =
-                "(function(){" +
-                "  var md=navigator.mediaDevices; if(!md||window.__mediaWrapped) return; window.__mediaWrapped=true;" +
-                "  var log=[];" +
-                "  function show(){" +
-                "    var p=document.getElementById('media-log');" +
-                "    if(!p){p=document.createElement('pre');p.id='media-log';" +
-                "      p.style.cssText='position:fixed;bottom:0;left:0;right:0;z-index:2147483647;background:rgba(0,0,0,.85);color:#ff0;font:10px monospace;padding:6px;margin:0;white-space:pre-wrap;max-height:38%;overflow:hidden;pointer-events:none;';" +
-                "      document.body.appendChild(p);}" +
-                "    p.textContent=log.slice(-9).join('\\n');" +
-                "  }" +
-                "  var ogum=md.getUserMedia.bind(md);" +
-                "  md.getUserMedia=function(c){" +
-                "    log.push('gUM '+JSON.stringify(c).slice(0,140));show();" +
-                "    return ogum(c).then(function(s){log.push('  OK '+s.getTracks().map(function(t){return t.kind+':'+t.readyState;}).join(','));show();return s;}," +
-                "      function(e){log.push('  ERR '+e.name+': '+e.message);show();throw e;});" +
-                "  };" +
-                "  var oenum=md.enumerateDevices.bind(md);" +
-                "  md.enumerateDevices=function(){" +
-                "    return oenum().then(function(d){log.push('enum '+d.map(function(x){return x.kind.slice(0,2)+(x.deviceId?'':'!id')+(x.label?'':'!lbl');}).join(' '));show();return d;});" +
-                "  };" +
-                "  if(navigator.permissions&&navigator.permissions.query){" +
-                "    var oq=navigator.permissions.query.bind(navigator.permissions);" +
-                "    navigator.permissions.query=function(d){" +
-                "      return oq(d).then(function(r){log.push('perm '+d.name+'='+r.state);show();return r;}," +
-                "        function(e){log.push('perm '+d.name+' ERR '+e.name);show();throw e;});" +
-                "    };" +
-                "  }" +
-                "  window.addEventListener('unhandledrejection',function(ev){" +
-                "    var r=ev.reason||{}; var t=(r.name||'')+' '+(r.message||r);" +
-                "    if(/NotAllowed|NotFound|Overconstrained|NotReadable|Permission|device/i.test(t)){log.push('REJECT '+String(t).slice(0,120));show();}" +
-                "  });" +
-                "  log.push('trace on');show();" +
                 "})();";
 
             private boolean canGoBackWithinTeams(WebView wv) {
@@ -254,6 +351,34 @@ jobs:
                 }
             }
 
+            private String pageHooksJs = null;
+
+            private String readAsset(String name) {
+                try (InputStream in = getAssets().open(name); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                    byte[] buf = new byte[4096];
+                    int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                    return out.toString("UTF-8");
+                } catch (Exception e) {
+                    Log.e("TeamsMobile", "Could not read asset " + name, e);
+                    return null;
+                }
+            }
+
+            // Injects assets/page-hooks.js at the very start of every page/frame load (before Teams' own scripts run).
+            private boolean installPageHooks() {
+                try {
+                    pageHooksJs = readAsset("page-hooks.js");
+                    if (pageHooksJs == null) return false;
+                    if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return false;
+                    WebViewCompat.addDocumentStartJavaScript(bridge.getWebView(), pageHooksJs, Collections.singleton("*"));
+                    return true;
+                } catch (Throwable t) {
+                    Log.e("TeamsMobile", "Could not install page hooks", t);
+                    return false;
+                }
+            }
+
             private boolean has(String permission) {
                 return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED;
             }
@@ -286,6 +411,7 @@ jobs:
                 }
 
                 installMediaPermissionClient();
+                installPageHooks();
 
                 // TEMPORARY: allows chrome://inspect on the phone to debug Teams. Remove once media works.
                 WebView.setWebContentsDebuggingEnabled(true);
@@ -347,15 +473,18 @@ jobs:
                             }, i * 1500);
                         }
 
-                        // Re-inject the (idempotent) media trace every 3 s so it survives page reloads/redirects
-                        final Runnable traceTick = new Runnable() {
-                            @Override
-                            public void run() {
-                                webView.evaluateJavascript(MEDIA_TRACE_JS, null);
-                                handler.postDelayed(this, 3000);
+                        // Fallback for the very first page load (document-start script may miss it): inject the same
+                        // idempotent script a few times during the first 30 s.
+                        if (pageHooksJs != null) {
+                            for (int k = 1; k <= 10; k++) {
+                                handler.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        webView.evaluateJavascript(pageHooksJs, null);
+                                    }
+                                }, k * 3000);
                             }
-                        };
-                        handler.postDelayed(traceTick, 1000);
+                        }
 
                         if (DIAG) {
                             for (int delay : new int[]{15000, 45000}) {

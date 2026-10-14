@@ -71,11 +71,16 @@ jobs:
                         settings.setDomStorageEnabled(true);
                         settings.setDatabaseEnabled(true);
                         settings.setSavePassword(true);
+                        settings.setSaveFormData(true);
                         
                         CookieManager cookieManager = CookieManager.getInstance();
                         cookieManager.setAcceptCookie(true);
                         cookieManager.setAcceptThirdPartyCookies(webView, true);
 
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                    cookieManager.flush();
+                }
+                
                         final String heavyCSSInjection = 
                             "(function() {" +
                             "  var id = 'custom-teams-margins';" +

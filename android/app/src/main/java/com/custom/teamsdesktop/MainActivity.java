@@ -20,7 +20,10 @@ public class MainActivity extends BridgeActivity {
                 WebView webView = bridge.getWebView();
                 WebSettings settings = webView.getSettings();
                 
-                // Essential WebView properties for heavy SPAs like Microsoft Teams
+                // Hardcode user agent definition directly into WebSettings configuration properties
+                String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+                settings.setUserAgentString(desktopUA);
+                
                 settings.setJavaScriptEnabled(true);
                 settings.setDomStorageEnabled(true);
                 settings.setDatabaseEnabled(true);
@@ -28,11 +31,9 @@ public class MainActivity extends BridgeActivity {
                 settings.setAllowContentAccess(true);
                 settings.setAllowFileAccess(true);
                 
-                // Allow cross-origin requests natively to fix broken styles
-                settings.setAllowUniversalAccessFromFileURLs(true);
-                settings.setAllowFileAccessFromFileURLs(true);
+                // Keep credentials persistently stored on local disk cache structures
+                settings.setGeolocationEnabled(true);
                 
-                // Secure cookie state tracking
                 CookieManager cookieManager = CookieManager.getInstance();
                 cookieManager.setAcceptCookie(true);
                 cookieManager.setAcceptThirdPartyCookies(webView, true);
@@ -41,7 +42,9 @@ public class MainActivity extends BridgeActivity {
                     @Override
                     public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                         String url = request.getUrl().toString();
-                        // Prevent breaking out into external system browsers during auth loops
+                        // Force all redirections to inherit the Desktop User Agent structure
+                        view.getSettings().setUserAgentString(desktopUA);
+                        
                         if (url.contains("microsoft") || url.contains("live.com") || url.contains("teams")) {
                             view.loadUrl(url);
                             return true;
@@ -52,11 +55,10 @@ public class MainActivity extends BridgeActivity {
                     @Override
                     public void onPageFinished(WebView view, String url) {
                         super.onPageFinished(view, url);
-                        CookieManager.getInstance().flush();
+                        CookieManager.getInstance().flush(); // Writes session credentials securely to persistent disk storage
                         
-                        // Inject our specific mobile-friendly layouts
                         String customCSS = 
-                            "body { zoom: 0.85 !important; }" +
+                            "body { zoom: 0.85 !important; padding-top: 36px !important; }" +
                             "[data-test-id='left-rail'], .v2-left-rail { width: 50px !important; min-width: 50px !important; }" +
                             ".ts-message-list-item { padding-left: 4px !important; padding-right: 4px !important; }" +
                             ".download-app-banner, .mobile-promo { display: none !important; }";

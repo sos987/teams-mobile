@@ -41,12 +41,12 @@ jobs:
     - name: Add Camera / Microphone / Audio Permissions to AndroidManifest
       run: |
         MANIFEST=android/app/src/main/AndroidManifest.xml
- 
+
         # Runtime-requestable permissions. Capacitor's WebChromeClient asks the user for
         # CAMERA / RECORD_AUDIO when Teams calls getUserMedia(), but only if they are declared here.
         # BLUETOOTH_CONNECT is needed on Android 12+ to route call audio to BT headsets.
         sed -i 's#</manifest>#    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />\n</manifest>#' "$MANIFEST"
- 
+
         echo "---- Resulting manifest ----"
         cat "$MANIFEST"
         grep -q "android.permission.RECORD_AUDIO" "$MANIFEST" || { echo "Manifest patch failed"; exit 1; }
@@ -57,46 +57,182 @@ jobs:
         cat << 'EOF' > android/app/src/main/java/com/custom/teamsdesktop/MainActivity.java
         package com.custom.teamsdesktop;
 
+        import android.Manifest;
+        import android.content.pm.PackageManager;
+        import android.os.Build;
         import android.os.Bundle;
         import android.os.Handler;
         import android.os.Looper;
+        import android.view.View;
+        import android.view.WindowManager;
         import android.webkit.CookieManager;
+        import android.webkit.PermissionRequest;
+        import android.webkit.ValueCallback;
+        import android.webkit.WebBackForwardList;
         import android.webkit.WebSettings;
         import android.webkit.WebView;
+        import androidx.activity.OnBackPressedCallback;
+        import androidx.core.app.ActivityCompat;
+        import androidx.core.content.ContextCompat;
         import com.getcapacitor.BridgeActivity;
+        import com.getcapacitor.BridgeWebChromeClient;
+        import java.util.ArrayList;
+        import java.util.List;
 
         public class MainActivity extends BridgeActivity {
+            private static final int MEDIA_PERMISSION_REQUEST = 4242;
+            private boolean permissionRequestInFlight = false;
+
+            // Closes the top-most dialog/panel in Teams by sending Escape. Returns true if one was found.
+            // If the same element is still there on the next press we let Back do something else (no trap).
+            private static final String CLOSE_TOP_LAYER_JS =
+                "(function(){" +
+                "  var els=[].slice.call(document.querySelectorAll('[role=dialog],[role=alertdialog],[aria-modal=true]'))" +
+                "    .filter(function(e){return e.offsetParent!==null||getComputedStyle(e).position==='fixed';});" +
+                "  var el=els[els.length-1];" +
+                "  if(!el){window.__lastBackEl=null;return false;}" +
+                "  if(window.__lastBackEl===el){window.__lastBackEl=null;return false;}" +
+                "  window.__lastBackEl=el;" +
+                "  var t=document.activeElement||document.body;" +
+                "  ['keydown','keyup'].forEach(function(type){" +
+                "    t.dispatchEvent(new KeyboardEvent(type,{key:'Escape',code:'Escape',keyCode:27,which:27,bubbles:true,cancelable:true}));" +
+                "  });" +
+                "  return true;" +
+                "})()";
+
+            private boolean canGoBackWithinTeams(WebView wv) {
+                WebBackForwardList list = wv.copyBackForwardList();
+                int idx = list.getCurrentIndex();
+                if (idx <= 0) return false;
+                String prev = list.getItemAtIndex(idx - 1).getUrl();
+                return prev != null && (prev.contains("teams.cloud.microsoft") || prev.contains("teams.microsoft.com"));
+            }
+
+            private void handleBack() {
+                final WebView wv = bridge.getWebView();
+                wv.evaluateJavascript(CLOSE_TOP_LAYER_JS, new ValueCallback<String>() {
+                    @Override
+                    public void onReceiveValue(String closedSomething) {
+                        if ("true".equals(closedSomething)) return;          // 1. a dialog/panel was closed
+                        if (canGoBackWithinTeams(wv)) { wv.goBack(); return; } // 2. navigate back inside Teams
+                        moveTaskToBack(true);                                  // 3. otherwise minimise, don't kill the session
+                    }
+                });
+            }
+
+            // Android WebView drops *session* cookies (no expiry) when the app process ends, unlike Chrome which restores them.
+            // Microsoft sign-in cookies are often session cookies, so we re-save them with an expiry on pause/stop.
+            private static final int COOKIE_LIFETIME_SECONDS = 30 * 24 * 3600;
+            private static final String[] COOKIE_HOSTS = {
+                "login.microsoftonline.com", "login.microsoft.com", "login.live.com",
+                "teams.cloud.microsoft", "teams.microsoft.com", "teams.live.com",
+                "www.office.com", "outlook.office.com", "outlook.office365.com", "m365.cloud.microsoft"
+            };
+
+            private void persistSessionCookies() {
+                CookieManager cm = CookieManager.getInstance();
+                for (String host : COOKIE_HOSTS) {
+                    String url = "https://" + host + "/";
+                    String all = cm.getCookie(url);
+                    if (all == null || all.isEmpty()) continue;
+                    boolean httpOnly = host.startsWith("login."); // auth cookies are HttpOnly; keep that, JS on Teams hosts may read theirs
+                    for (String pair : all.split(";")) {
+                        pair = pair.trim();
+                        if (pair.indexOf('=') <= 0) continue;
+                        cm.setCookie(url, pair + "; Max-Age=" + COOKIE_LIFETIME_SECONDS
+                            + "; Path=/; Secure; SameSite=None" + (httpOnly ? "; HttpOnly" : ""));
+                    }
+                }
+                cm.flush();
+            }
+
+            private boolean has(String permission) {
+                return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED;
+            }
+
             @Override
             public void onCreate(Bundle savedInstanceState) {
                 super.onCreate(savedInstanceState);
-                
+
+                // Android Back: close dialogs / go back in Teams instead of closing the app
+                getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+                    @Override
+                    public void handleOnBackPressed() {
+                        handleBack();
+                    }
+                });
+
+                // Keep the focused field visible above the keyboard (helps password autofill)
+                getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+
+                // Ask for camera/mic up-front, so they are already granted when Teams probes devices.
+                List<String> missing = new ArrayList<>();
+                if (!has(Manifest.permission.CAMERA)) missing.add(Manifest.permission.CAMERA);
+                if (!has(Manifest.permission.RECORD_AUDIO)) missing.add(Manifest.permission.RECORD_AUDIO);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !has(Manifest.permission.BLUETOOTH_CONNECT)) {
+                    missing.add(Manifest.permission.BLUETOOTH_CONNECT);
+                }
+                if (!missing.isEmpty()) {
+                    permissionRequestInFlight = true;
+                    ActivityCompat.requestPermissions(this, missing.toArray(new String[0]), MEDIA_PERMISSION_REQUEST);
+                }
+
+                // TEMPORARY: allows chrome://inspect on the phone to debug Teams. Remove once media works.
+                WebView.setWebContentsDebuggingEnabled(true);
+
                 this.bridge.getWebView().post(new Runnable() {
                     @Override
                     public void run() {
                         final WebView webView = bridge.getWebView();
                         WebSettings settings = webView.getSettings();
-                        
-                        // Заменяем User-Agent на Linux Chrome, чтобы обойти проверку корпоративных политик Ericsson
+
+                        // Keep Capacitor's own WebChromeClient (file chooser etc.), only change media permission handling
+                        webView.setWebChromeClient(new BridgeWebChromeClient(bridge) {
+                            @Override
+                            public void onPermissionRequest(final PermissionRequest request) {
+                                // WebView calls this on the UI thread already
+                                boolean needCamera = false, needMic = false;
+                                for (String r : request.getResources()) {
+                                    if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(r)) needCamera = true;
+                                    if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) needMic = true;
+                                }
+                                boolean ok = (!needCamera || has(Manifest.permission.CAMERA))
+                                        && (!needMic || has(Manifest.permission.RECORD_AUDIO));
+                                if (ok) {
+                                    request.grant(request.getResources());
+                                } else if (permissionRequestInFlight) {
+                                    request.deny(); // system dialog already showing; page is reloaded after the answer
+                                } else {
+                                    super.onPermissionRequest(request); // Capacitor's own prompt flow
+                                }
+                            }
+                        });
+
                         String desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
                         settings.setUserAgentString(desktopUA);
-                        
+
                         settings.setJavaScriptEnabled(true);
                         settings.setDomStorageEnabled(true);
                         settings.setDatabaseEnabled(true);
                         settings.setSavePassword(true);
                         settings.setSaveFormData(true);
 
+                        // Use the system autofill framework (Google / Samsung / Bitwarden...) for login fields
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            webView.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_YES);
+                        }
+                        webView.setFocusable(true);
+                        webView.setFocusableInTouchMode(true);
+
+                        // Let remote call audio / ringtones play without a tap
                         settings.setMediaPlaybackRequiresUserGesture(false);
-                        
+
                         CookieManager cookieManager = CookieManager.getInstance();
                         cookieManager.setAcceptCookie(true);
                         cookieManager.setAcceptThirdPartyCookies(webView, true);
+                        cookieManager.flush();
 
-                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                    cookieManager.flush();
-                }
-                
-                        final String heavyCSSInjection = 
+                        final String heavyCSSInjection =
                             "(function() {" +
                             "  var id = 'custom-teams-margins';" +
                             "  if (document.getElementById(id)) return;" +
@@ -127,9 +263,27 @@ jobs:
             }
 
             @Override
+            public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                if (requestCode == MEDIA_PERMISSION_REQUEST) {
+                    permissionRequestInFlight = false;
+                    // Teams probed devices before the permissions existed, so make it probe again
+                    if (has(Manifest.permission.CAMERA) || has(Manifest.permission.RECORD_AUDIO)) {
+                        bridge.getWebView().reload();
+                    }
+                }
+            }
+
+            @Override
             public void onPause() {
                 super.onPause();
-                CookieManager.getInstance().flush();
+                persistSessionCookies();
+            }
+
+            @Override
+            public void onStop() {
+                super.onStop();
+                persistSessionCookies();
             }
         }
         EOF

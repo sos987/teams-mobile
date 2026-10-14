@@ -16,14 +16,24 @@ jobs:
     - name: Set up Node.js
       uses: actions/setup-node@v4
       with:
-        node-size: 20
         node-version: 20
 
-    - name: Install Project Dependencies
+    - name: Install & Fix Dependencies
       run: |
         npm install
-        npx cap init --web-dir=www
+        npm audit fix --force  # Automatically patches the high/critical vulnerabilities
+
+    - name: Sync & Prepare Capacitor Android
+      run: |
+        # 1. Clear out pre-existing local android directories to prevent collisions
+        rm -rf android
+        
+        # 2. Initialize with non-interactive parameters explicitly passed
+        npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www
+        
+        # 3. Freshly construct the platform wrapper
         npx cap add android
+        npx cap sync android
 
     - name: Set up Java Environment
       uses: actions/setup-java@v4

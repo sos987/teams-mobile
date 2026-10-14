@@ -22,19 +22,101 @@ jobs:
       run: |
         npm install
 
-    - name: Ensure Android Platform Exists and Sync
+    - name: Generate Native Android Project Fresh
       run: |
-        # Если папка www отсутствует, создаем её, так как Capacitor строго требует её наличие при инициализации
+        # 1. Создаем заглушку веб-директории, так как Capacitor строго требует её наличие
         mkdir -p www
-        touch www/index.html
+        echo '<!DOCTYPE html><html><head><title>Teams</title></head><body>Loading...</body></html>' > www/index.html
         
-        # Проверяем, существует ли папка android. Если нет — генерируем её корректными CLI-командами
-        if [ ! -d "android" ]; then
-          echo "Папка android отсутствует. Генерируем нативную платформу..."
-          npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www
-          npx cap add android
-        fi
+        # 2. Инициализируем конфигурацию приложения в неинтерактивном режиме
+        npx cap init "Teams Desktop PWA" "com.custom.teamsdesktop" --web-dir=www
+        
+        # 3. Генерируем с нуля папку android и файл gradlew
+        npx cap add android
         npx cap sync android
+
+    - name: Inject Custom MainActivity Java Code
+      run: |
+        # Записываем наш кастомный Java-код со сдвигом шапки и persistent-куками поверх сгенерированного шаблона
+        cat << 'EOF' > android/app/src/main/java/com/custom/teamsdesktop/MainActivity.java
+        package com.custom.teamsdesktop;
+
+        import android.os.Bundle;
+        import android.os.Handler;
+        import android.os.Looper;
+        import android.webkit.CookieManager;
+        import android.webkit.WebSettings;
+        import android.webkit.WebView;
+        import com.getcapacitor.BridgeActivity;
+
+        public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+                super.onCreate(savedInstanceState);
+                
+                this.bridge.getWebView().post(new Runnable() {
+                    @Override
+                    public void run() {
+                        final WebView webView = bridge.getWebView();
+                        WebSettings settings = webView.getSettings();
+                        
+                        String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+                        settings.setUserAgentString(desktopUA);
+                        
+                        settings.setJavaScriptEnabled(true);
+                        settings.setDomStorageEnabled(true);
+                        settings.setDatabaseEnabled(true);
+                        settings.setSavePassword(true);
+                        
+                        CookieManager cookieManager = CookieManager.getInstance();
+                        cookieManager.setAcceptCookie(true);
+                        cookieManager.setAcceptThirdPartyCookies(webView, true);
+
+                        final String heavyCSSInjection = 
+                            "(function() {" +
+                            "  var id = 'custom-teams-margins';" +
+                            "  if (document.getElementById(id)) return;" +
+                            "  var style = document.createElement('style');" +
+                            "  style.id = id;" +
+                            "  style.type = 'text/css';" +
+                            "  style.innerHTML = '" +
+                            "    body, html, #app-container, .app-width, #main-layout-id {" +
+                            "      padding-top: 45px !important;" +
+                            "      box-sizing: border-box !important;" +
+                            "    }" +
+                            "    #tou-header-layout, .v2-header, [data-test-id=\"desktop-header\"], div[class*=\"header-container\"] {" +
+                            "      top: 45px !important;" +
+                            "    }" +
+                            "    .v2-left-rail, [data-test-id=\"left-rail\"], div[class*=\"leftRail\"] {" +
+                            "      top: 95px !important;" +
+                            "      width: 50px !important; min-width: 50px !important;" +
+                            "    }" +
+                            "    body { zoom: 0.85 !important; }" +
+                            "    .download-app-banner, .mobile-promo { display: none !important; }" +
+                            "  ';" +
+                            "  document.head.appendChild(style);" +
+                            "})();";
+
+                        final Handler handler = new Handler(Looper.getMainLooper());
+                        for (int i = 0; i < 10; i++) {
+                            handler.postDelayed(new Runnable() {
+                                @Override
+                                public void run() {
+                                    webView.evaluateJavascript(heavyCSSInjection, null);
+                                }
+                            }, i * 1500);
+                        }
+                    }
+                });
+            }
+
+            @Override
+            protected void onPause() {
+                super.onPause();
+                CookieManager.getInstance().flush();
+            }
+        }
+        EOF
 
     - name: Set up Java Environment
       uses: actions/setup-java@v4

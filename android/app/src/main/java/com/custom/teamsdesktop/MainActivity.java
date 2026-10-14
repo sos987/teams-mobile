@@ -2,7 +2,7 @@ package com.custom.teamsdesktop;
 
 import android.os.Bundle;
 import android.util.Base64;
-import android.webkit.CookieManager; // Import Cookie Manager
+import android.webkit.CookieManager;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -19,22 +19,24 @@ public class MainActivity extends BridgeActivity {
                 WebView webView = bridge.getWebView();
                 WebSettings settings = webView.getSettings();
                 
-                // 1. Force state storage persistence parameters
                 settings.setDomStorageEnabled(true);
                 settings.setDatabaseEnabled(true);
                 settings.setSavePassword(true);
+                settings.setJavaScriptEnabled(true);
                 
-                // 2. Instruct the engine to accept and retain session authentication tokens
+                // Allow cookies and tell the engine to flush them directly to the persistent storage layer
                 CookieManager cookieManager = CookieManager.getInstance();
                 cookieManager.setAcceptCookie(true);
                 cookieManager.setAcceptThirdPartyCookies(webView, true);
+                cookieManager.flush();
                 
                 webView.setWebViewClient(new WebViewClient() {
                     @Override
                     public void onPageFinished(WebView view, String url) {
                         super.onPageFinished(view, url);
+                        CookieManager.getInstance().flush(); // Forces saving to disk instantly
                         
-                        // Inject our updated mobile-friendly styles
+                        // Mobile UI Style Injection
                         String customCSS = "body { zoom: 0.85 !important; }" +
                                            "[data-test-id='left-rail'], .v2-left-rail { width: 50px !important; min-width: 50px !important; }" +
                                            ".ts-message-list-item { padding-left: 4px !important; padding-right: 4px !important; }" +

@@ -93,12 +93,12 @@ jobs:
 
           // Client hints: match the desktop Linux Chrome user-agent instead of advertising "Android WebView, mobile".
           try {
-            var brands = [{ brand: 'Chromium', version: '155' }, { brand: 'Google Chrome', version: '155' }, { brand: 'Not A(Brand)', version: '99' }];
-            var full = [{ brand: 'Chromium', version: '155.0.0.0' }, { brand: 'Google Chrome', version: '155.0.0.0' }, { brand: 'Not A(Brand)', version: '99.0.0.0' }];
+            var brands = [{ brand: 'Chromium', version: '156' }, { brand: 'Google Chrome', version: '156' }, { brand: 'Not A(Brand)', version: '99' }];
+            var full = [{ brand: 'Chromium', version: '156.0.0.0' }, { brand: 'Google Chrome', version: '156.0.0.0' }, { brand: 'Not A(Brand)', version: '99.0.0.0' }];
             var uad = {
               brands: brands, mobile: false, platform: 'Linux',
               getHighEntropyValues: function () {
-                return Promise.resolve({ brands: brands, mobile: false, platform: 'Linux', platformVersion: '6.5.0', architecture: 'x86', bitness: '64', model: '', uaFullVersion: '155.0.0.0', fullVersionList: full, wow64: false });
+                return Promise.resolve({ brands: brands, mobile: false, platform: 'Linux', platformVersion: '6.5.0', architecture: 'x86', bitness: '64', model: '', uaFullVersion: '156.0.0.0', fullVersionList: full, wow64: false });
               },
               toJSON: function () { return { brands: brands, mobile: false, platform: 'Linux' }; }
             };
@@ -122,6 +122,10 @@ jobs:
         import android.os.Build;
         import android.os.Bundle;
         import android.os.Handler;
+        import android.graphics.Bitmap;
+        import android.net.Uri;
+        import android.net.http.SslCertificate;
+        import android.net.http.SslError;
         import android.os.Looper;
         import android.view.View;
         import android.view.WindowManager;
@@ -129,7 +133,10 @@ jobs:
         import android.webkit.PermissionRequest;
         import android.webkit.ValueCallback;
         import android.webkit.WebBackForwardList;
+        import android.webkit.SslErrorHandler;
+        import android.webkit.WebResourceError;
         import android.webkit.WebResourceRequest;
+        import android.webkit.WebResourceResponse;
         import android.webkit.WebSettings;
         import android.webkit.WebView;
         import androidx.activity.OnBackPressedCallback;
@@ -247,18 +254,112 @@ jobs:
                 }
             }
 
-            // Capacitor cancels any navigation to a host that is not in allowNavigation (and opens the system browser instead).
-            // For a *server redirect* during sign-in (Microsoft / conditional-access proxy hops) that cancel shows
-            // "Webpage not available - net::ERR_FAILED", so redirects of the main frame are always followed in-app.
+            // ---- Navigation handling + load-error diagnostics -------------------------------------------------------
+            // Keeps a short trail of navigations (query strings stripped, they can contain tokens) and, if the page
+            // cannot be loaded, shows the real error plus that trail instead of Android's generic error page.
+            private final ArrayList<String> navTrail = new ArrayList<>();
+            private boolean loadedOnce = false;
+
+            private void trail(String entry) {
+                synchronized (navTrail) {
+                    navTrail.add(entry);
+                    while (navTrail.size() > 30) navTrail.remove(0);
+                }
+            }
+
+            private static String stripQuery(String url) {
+                try {
+                    Uri u = Uri.parse(url);
+                    String path = u.getPath();
+                    return u.getScheme() + "://" + u.getHost() + (path == null ? "" : path);
+                } catch (Exception e) {
+                    return "?";
+                }
+            }
+
+            private static String esc(String s) {
+                if (s == null) return "";
+                return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+            }
+
+            private void showErrorPage(final WebView view, String title, String detail) {
+                final StringBuilder sb = new StringBuilder();
+                sb.append("<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>")
+                  .append("<body style='background:#1f1f1f;color:#ddd;font-family:sans-serif;padding:16px'>")
+                  .append("<h2>").append(esc(title)).append("</h2>")
+                  .append("<p style='word-break:break-all;white-space:pre-wrap'>").append(esc(detail)).append("</p>")
+                  .append("<p><a style='color:#8ab4f8;font-size:20px' href='https://teams.cloud.microsoft/'>Retry</a></p>")
+                  .append("<h3>Navigation trail</h3><pre style='white-space:pre-wrap;word-break:break-all;font-size:12px'>");
+                synchronized (navTrail) {
+                    for (String t : navTrail) sb.append(esc(t)).append("\n");
+                }
+                sb.append("</pre></body></html>");
+                view.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        view.loadDataWithBaseURL(null, sb.toString(), "text/html", "utf-8", null);
+                    }
+                });
+            }
+
             private void installNavigationClient() {
                 try {
                     bridge.getWebView().setWebViewClient(new BridgeWebViewClient(bridge) {
                         @Override
                         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                            if (request.isForMainFrame() && request.isRedirect()) {
-                                return false;
-                            }
+                            boolean redirect = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && request.isRedirect();
+                            trail((redirect ? "redirect " : "navigate ") + (request.isForMainFrame() ? "" : "(subframe) ")
+                                + stripQuery(request.getUrl().toString()));
+                            // Never abort a server redirect of the main page (sign-in chains)
+                            if (request.isForMainFrame() && redirect) return false;
                             return super.shouldOverrideUrlLoading(view, request);
+                        }
+
+                        @Override
+                        public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                            trail("started " + stripQuery(url));
+                            super.onPageStarted(view, url, favicon);
+                        }
+
+                        @Override
+                        public void onPageFinished(WebView view, String url) {
+                            if (url != null && url.startsWith("https://")) loadedOnce = true;
+                            super.onPageFinished(view, url);
+                        }
+
+                        @Override
+                        public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && request.isForMainFrame()) {
+                                String detail = "Code " + error.getErrorCode() + ": " + error.getDescription()
+                                    + "\nURL: " + stripQuery(request.getUrl().toString());
+                                trail("ERROR " + detail.replace("\n", " | "));
+                                showErrorPage(view, "Page could not be loaded", detail);
+                                return;
+                            }
+                            super.onReceivedError(view, request, error);
+                        }
+
+                        @Override
+                        public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
+                            if (request.isForMainFrame()) {
+                                trail("HTTP " + errorResponse.getStatusCode() + " " + stripQuery(request.getUrl().toString()));
+                            }
+                            super.onReceivedHttpError(view, request, errorResponse);
+                        }
+
+                        @Override
+                        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+                            String detail = "SSL error " + error.getPrimaryError()
+                                + " (0 not yet valid, 1 expired, 2 hostname mismatch, 3 untrusted, 4 bad date, 5 invalid)"
+                                + "\nURL: " + stripQuery(error.getUrl());
+                            SslCertificate cert = error.getCertificate();
+                            if (cert != null) {
+                                detail += "\nIssued by: " + cert.getIssuedBy().getDName()
+                                    + "\nIssued to: " + cert.getIssuedTo().getCName();
+                            }
+                            trail("SSL " + detail.replace("\n", " | "));
+                            handler.cancel(); // never proceed past certificate errors
+                            if (!loadedOnce) showErrorPage(view, "Secure connection failed", detail);
                         }
                     });
                 } catch (Throwable ignored) {

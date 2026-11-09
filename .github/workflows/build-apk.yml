@@ -144,6 +144,8 @@ jobs:
         import androidx.activity.OnBackPressedCallback;
         import androidx.core.app.ActivityCompat;
         import androidx.core.content.ContextCompat;
+        import androidx.webkit.UserAgentMetadata;
+        import androidx.webkit.WebSettingsCompat;
         import androidx.webkit.WebViewCompat;
         import androidx.webkit.WebViewFeature;
         import com.getcapacitor.BridgeActivity;
@@ -152,6 +154,7 @@ jobs:
         import java.io.ByteArrayOutputStream;
         import java.io.InputStream;
         import java.util.ArrayList;
+        import java.util.Arrays;
         import java.util.Collections;
         import java.util.regex.Matcher;
         import java.util.regex.Pattern;
@@ -375,27 +378,55 @@ jobs:
             // WebView auto-updates (every ~2 weeks now), so a hardcoded version goes stale and servers can reject the mismatch.
             private static final String START_URL = "https://teams.cloud.microsoft";
 
-            private String buildDesktopUserAgent() {
-                String major = "157";
+            private String chromeMajor() {
                 try {
                     Matcher m = Pattern.compile("Chrome/(\\d+)").matcher(WebSettings.getDefaultUserAgent(this));
-                    if (m.find()) major = m.group(1);
+                    if (m.find()) return m.group(1);
                 } catch (Throwable ignored) {
                     // keep fallback
                 }
-                return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + major + ".0.0.0 Safari/537.36";
+                return "157";
+            }
+
+            private String buildDesktopUserAgent() {
+                return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + chromeMajor() + ".0.0.0 Safari/537.36";
+            }
+
+            // The Sec-CH-UA* request headers (and navigator.userAgentData) otherwise still say "Android WebView / mobile / Android",
+            // which contradicts the desktop user-agent. Make them agree with it.
+            private void applyDesktopClientHints(WebView wv) {
+                try {
+                    if (!WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) return;
+                    String major = chromeMajor();
+                    String full = major + ".0.0.0";
+                    UserAgentMetadata metadata = new UserAgentMetadata.Builder()
+                        .setBrandVersionList(Arrays.asList(
+                            new UserAgentMetadata.BrandVersion.Builder().setBrand("Chromium").setMajorVersion(major).setFullVersion(full).build(),
+                            new UserAgentMetadata.BrandVersion.Builder().setBrand("Google Chrome").setMajorVersion(major).setFullVersion(full).build(),
+                            new UserAgentMetadata.BrandVersion.Builder().setBrand("Not A(Brand)").setMajorVersion("99").setFullVersion("99.0.0.0").build()))
+                        .setFullVersion(full)
+                        .setPlatform("Linux")
+                        .setPlatformVersion("6.5.0")
+                        .setArchitecture("x86")
+                        .setBitness(64)
+                        .setModel("")
+                        .setMobile(false)
+                        .setWow64(false)
+                        .build();
+                    WebSettingsCompat.setUserAgentMetadata(wv.getSettings(), metadata);
+                } catch (Throwable ignored) {
+                    // headers stay as they are
+                }
             }
 
             private void applyDesktopUserAgent() {
                 try {
                     WebView wv = bridge.getWebView();
-                    String ua = buildDesktopUserAgent();
-                    if (!ua.equals(wv.getSettings().getUserAgentString())) {
-                        wv.getSettings().setUserAgentString(ua);
-                        // the first request may already have gone out with the previous user-agent: restart it with the right one
-                        wv.stopLoading();
-                        wv.loadUrl(START_URL);
-                    }
+                    wv.getSettings().setUserAgentString(buildDesktopUserAgent());
+                    applyDesktopClientHints(wv);
+                    // the first request may already have gone out with the previous identity: restart it with the right one
+                    wv.stopLoading();
+                    wv.loadUrl(START_URL);
                 } catch (Throwable ignored) {
                     // keep whatever user-agent is set
                 }

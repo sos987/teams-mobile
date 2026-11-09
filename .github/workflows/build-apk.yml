@@ -129,6 +129,7 @@ jobs:
         import android.webkit.PermissionRequest;
         import android.webkit.ValueCallback;
         import android.webkit.WebBackForwardList;
+        import android.webkit.WebResourceRequest;
         import android.webkit.WebSettings;
         import android.webkit.WebView;
         import androidx.activity.OnBackPressedCallback;
@@ -138,6 +139,7 @@ jobs:
         import androidx.webkit.WebViewFeature;
         import com.getcapacitor.BridgeActivity;
         import com.getcapacitor.BridgeWebChromeClient;
+        import com.getcapacitor.BridgeWebViewClient;
         import java.io.ByteArrayOutputStream;
         import java.io.InputStream;
         import java.util.ArrayList;
@@ -245,6 +247,25 @@ jobs:
                 }
             }
 
+            // Capacitor cancels any navigation to a host that is not in allowNavigation (and opens the system browser instead).
+            // For a *server redirect* during sign-in (Microsoft / conditional-access proxy hops) that cancel shows
+            // "Webpage not available - net::ERR_FAILED", so redirects of the main frame are always followed in-app.
+            private void installNavigationClient() {
+                try {
+                    bridge.getWebView().setWebViewClient(new BridgeWebViewClient(bridge) {
+                        @Override
+                        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                            if (request.isForMainFrame() && request.isRedirect()) {
+                                return false;
+                            }
+                            return super.shouldOverrideUrlLoading(view, request);
+                        }
+                    });
+                } catch (Throwable ignored) {
+                    // fall back to Capacitor's default WebViewClient
+                }
+            }
+
             private String pageHooksJs = null;
 
             private String readAsset(String name) {
@@ -303,6 +324,7 @@ jobs:
                 }
 
                 installMediaPermissionClient();
+                installNavigationClient();
                 installPageHooks();
 
                 this.bridge.getWebView().post(new Runnable() {
@@ -311,7 +333,7 @@ jobs:
                         final WebView webView = bridge.getWebView();
                         WebSettings settings = webView.getSettings();
 
-                        String desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
+                        String desktopUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
                         settings.setUserAgentString(desktopUA);
 
                         settings.setJavaScriptEnabled(true);

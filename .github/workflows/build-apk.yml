@@ -70,6 +70,22 @@ jobs:
           'use strict';
           if (window.__teamsHooks) return;
           window.__teamsHooks = true;
+          var NATIVE_UACH = __NATIVE_UACH__; // replaced by MainActivity before injection
+
+          // EXPERIMENT: hide service workers from the page and unregister existing ones. Teams fails on reload in
+          // browsers on this phone while a fresh sign-in works, which is the classic sign of a failing service worker.
+          // If reloads work with this on, that is the cause; set to false to turn it off again.
+          var DISABLE_SERVICE_WORKER = true;
+          if (DISABLE_SERVICE_WORKER) {
+            try {
+              if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+                navigator.serviceWorker.getRegistrations().then(function (rs) {
+                  rs.forEach(function (r) { r.unregister(); });
+                }).catch(function () {});
+              }
+              delete Navigator.prototype.serviceWorker;
+            } catch (e) {}
+          }
 
           // WebView always reports camera/microphone permission as 'prompt' (it does not remember grants),
           // which makes Teams think access is missing. Android's real permission still decides whether
@@ -91,8 +107,9 @@ jobs:
             }
           } catch (e) {}
 
-          // Client hints: match the desktop Linux Chrome user-agent instead of advertising "Android WebView, mobile".
-          try {
+          // Client hints: when the native WebView API could not set them (NATIVE_UACH false), fake them for page scripts.
+          // Otherwise the native metadata already makes headers and navigator.userAgentData agree with the desktop user-agent.
+          if (!NATIVE_UACH) try {
             var uaMatch = /Chrome\/(\d+)/.exec(navigator.userAgent);
             var major = uaMatch ? uaMatch[1] : '157'; // follow the real WebView version, never hardcode
             var brands = [{ brand: 'Chromium', version: major }, { brand: 'Google Chrome', version: major }, { brand: 'Not A(Brand)', version: '99' }];
@@ -156,6 +173,7 @@ jobs:
         import java.util.ArrayList;
         import java.util.Arrays;
         import java.util.Collections;
+        import java.util.List;
         import java.util.regex.Matcher;
         import java.util.regex.Pattern;
         import java.util.List;
@@ -392,19 +410,28 @@ jobs:
                 return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + chromeMajor() + ".0.0.0 Safari/537.36";
             }
 
+            private boolean nativeHintsApplied = false;
+
             // The Sec-CH-UA* request headers (and navigator.userAgentData) otherwise still say "Android WebView / mobile / Android",
-            // which contradicts the desktop user-agent. Make them agree with it.
-            private void applyDesktopClientHints(WebView wv) {
+            // which contradicts the desktop user-agent. We start from the WebView's REAL metadata (so the version numbers, the
+            // GREASE brand and the brand order are exactly what Chrome of this version generates) and only change what a
+            // desktop Chrome would say differently: "Android WebView" -> "Google Chrome", platform Linux, not mobile.
+            private boolean applyDesktopClientHints(WebView wv) {
                 try {
-                    if (!WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) return;
-                    String major = chromeMajor();
-                    String full = major + ".0.0.0";
+                    if (!WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) return false;
+                    UserAgentMetadata cur = WebSettingsCompat.getUserAgentMetadata(wv.getSettings());
+                    List<UserAgentMetadata.BrandVersion> brands = new ArrayList<>();
+                    for (UserAgentMetadata.BrandVersion b : cur.getBrandVersionList()) {
+                        String name = "Android WebView".equals(b.getBrand()) ? "Google Chrome" : b.getBrand();
+                        brands.add(new UserAgentMetadata.BrandVersion.Builder()
+                            .setBrand(name)
+                            .setMajorVersion(b.getMajorVersion())
+                            .setFullVersion(b.getFullVersion())
+                            .build());
+                    }
                     UserAgentMetadata metadata = new UserAgentMetadata.Builder()
-                        .setBrandVersionList(Arrays.asList(
-                            new UserAgentMetadata.BrandVersion.Builder().setBrand("Chromium").setMajorVersion(major).setFullVersion(full).build(),
-                            new UserAgentMetadata.BrandVersion.Builder().setBrand("Google Chrome").setMajorVersion(major).setFullVersion(full).build(),
-                            new UserAgentMetadata.BrandVersion.Builder().setBrand("Not A(Brand)").setMajorVersion("99").setFullVersion("99.0.0.0").build()))
-                        .setFullVersion(full)
+                        .setBrandVersionList(brands)
+                        .setFullVersion(cur.getFullVersion())
                         .setPlatform("Linux")
                         .setPlatformVersion("6.5.0")
                         .setArchitecture("x86")
@@ -414,21 +441,31 @@ jobs:
                         .setWow64(false)
                         .build();
                     WebSettingsCompat.setUserAgentMetadata(wv.getSettings(), metadata);
+                    return true;
                 } catch (Throwable ignored) {
-                    // headers stay as they are
+                    return false; // the page script will fake navigator.userAgentData instead
                 }
             }
 
-            private void applyDesktopUserAgent() {
+            // Must run before installPageHooks() (which needs to know whether the native hints are in place).
+            private void setDesktopIdentity() {
                 try {
                     WebView wv = bridge.getWebView();
                     wv.getSettings().setUserAgentString(buildDesktopUserAgent());
-                    applyDesktopClientHints(wv);
-                    // the first request may already have gone out with the previous identity: restart it with the right one
+                    nativeHintsApplied = applyDesktopClientHints(wv);
+                } catch (Throwable ignored) {
+                    // keep whatever identity is set
+                }
+            }
+
+            // The first request may already have gone out with the previous identity: restart it with the new one.
+            private void restartStartPage() {
+                try {
+                    WebView wv = bridge.getWebView();
                     wv.stopLoading();
                     wv.loadUrl(START_URL);
                 } catch (Throwable ignored) {
-                    // keep whatever user-agent is set
+                    // nothing to do
                 }
             }
 
@@ -450,6 +487,7 @@ jobs:
                 try {
                     pageHooksJs = readAsset("page-hooks.js");
                     if (pageHooksJs == null) return false;
+                    pageHooksJs = pageHooksJs.replace("__NATIVE_UACH__", String.valueOf(nativeHintsApplied));
                     if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return false;
                     WebViewCompat.addDocumentStartJavaScript(bridge.getWebView(), pageHooksJs, Collections.singleton("*"));
                     return true;
@@ -489,10 +527,14 @@ jobs:
                     ActivityCompat.requestPermissions(this, missing.toArray(new String[0]), MEDIA_PERMISSION_REQUEST);
                 }
 
+                // TEMPORARY: lets chrome://inspect show the real network error and request headers. Remove when fixed.
+                WebView.setWebContentsDebuggingEnabled(true);
+
                 installMediaPermissionClient();
                 installNavigationClient();
+                setDesktopIdentity();
                 installPageHooks();
-                applyDesktopUserAgent();
+                restartStartPage();
 
                 this.bridge.getWebView().post(new Runnable() {
                     @Override

@@ -48,18 +48,22 @@ jobs:
         cp -r icons/res/. "$RES"/
         echo "Installed icons:"; find "$RES" -name 'ic_launcher*' -o -name 'teams_icon*' | sort
 
-    - name: Add Camera / Microphone / Audio Permissions to AndroidManifest
+    - name: Add Permissions and Foreground Service to AndroidManifest
       run: |
         MANIFEST=android/app/src/main/AndroidManifest.xml
 
-        # Runtime-requestable permissions. Capacitor's WebChromeClient asks the user for
-        # CAMERA / RECORD_AUDIO when Teams calls getUserMedia(), but only if they are declared here.
-        # BLUETOOTH_CONNECT is needed on Android 12+ to route call audio to BT headsets.
-        sed -i 's#</manifest>#    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />\n</manifest>#' "$MANIFEST"
+        # Runtime permissions: Capacitor's WebChromeClient asks for CAMERA / RECORD_AUDIO when Teams calls getUserMedia().
+        # BLUETOOTH_CONNECT routes call audio to BT headsets (Android 12+), POST_NOTIFICATIONS shows notifications (Android 13+).
+        # The FOREGROUND_SERVICE* permissions and WAKE_LOCK are for keeping calls and the session alive in the background.
+        sed -i 's#</manifest>#    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-permission android:name="android.permission.WAKE_LOCK" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />\n    <uses-feature android:name="android.hardware.microphone" android:required="false" />\n</manifest>#' "$MANIFEST"
+
+        # Foreground service that keeps the session / calls alive
+        sed -i 's#</application>#        <service android:name=".TeamsForegroundService" android:exported="false" android:foregroundServiceType="dataSync|microphone|camera|specialUse">\n            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Keeps the Teams web session alive in the background for messages and calls" />\n        </service>\n    </application>#' "$MANIFEST"
 
         echo "---- Resulting manifest ----"
         cat "$MANIFEST"
-        grep -q "android.permission.RECORD_AUDIO" "$MANIFEST" || { echo "Manifest patch failed"; exit 1; }
+        grep -q "android.permission.RECORD_AUDIO" "$MANIFEST" || { echo "Permission patch failed"; exit 1; }
+        grep -q "TeamsForegroundService" "$MANIFEST" || { echo "Service patch failed"; exit 1; }
 
     - name: Add Page Hooks Script and androidx.webkit Dependency
       run: |
@@ -72,9 +76,21 @@ jobs:
           window.__teamsHooks = true;
           var NATIVE_UACH = __NATIVE_UACH__; // replaced by MainActivity before injection
 
-          // EXPERIMENT: hide service workers from the page and unregister existing ones. Teams fails on reload in
-          // browsers on this phone while a fresh sign-in works, which is the classic sign of a failing service worker.
-          // If reloads work with this on, that is the cause; set to false to turn it off again.
+          var IS_TEAMS = /^teams\.(cloud\.microsoft|microsoft\.com)$/.test(location.hostname);
+          var IS_TOP = (window === window.top);
+
+          // Talks to the Android app (only exists on the Teams origins, see MainActivity.installNativeBridge)
+          function post(message) {
+            try {
+              if (window.TeamsNative && typeof window.TeamsNative.postMessage === 'function') {
+                window.TeamsNative.postMessage(JSON.stringify(message));
+              }
+            } catch (e) {}
+          }
+
+          // Teams' service worker fails on reload in WebView on some devices (first load works, every later load ends in
+          // net::ERR_FAILED). Hide service workers from the page and unregister existing ones so Teams loads from the network.
+          // Set to false to turn this off again.
           var DISABLE_SERVICE_WORKER = true;
           if (DISABLE_SERVICE_WORKER) {
             try {
@@ -89,19 +105,86 @@ jobs:
 
           // WebView always reports camera/microphone permission as 'prompt' (it does not remember grants),
           // which makes Teams think access is missing. Android's real permission still decides whether
-          // getUserMedia succeeds, so we only change what the page reads here.
+          // getUserMedia succeeds, so we only change what the page reads here. Same for notifications on Teams
+          // (they are delivered through the Android app, see below).
           try {
             var P = window.Permissions && window.Permissions.prototype;
             if (P && P.query) {
               var originalQuery = P.query;
               P.query = function (descriptor) {
                 var name = descriptor && descriptor.name;
-                var isMedia = (name === 'microphone' || name === 'camera');
+                var overridden = (name === 'microphone' || name === 'camera' || (IS_TEAMS && name === 'notifications'));
                 return originalQuery.apply(this, arguments).then(function (status) {
-                  if (isMedia) {
+                  if (overridden) {
                     try { Object.defineProperty(status, 'state', { get: function () { return 'granted'; } }); } catch (e) {}
                   }
                   return status;
+                });
+              };
+            }
+          } catch (e) {}
+
+          // Camera: the preview and the self-view are stretched in WebView. A likely reason is that Teams reads the
+          // track's width/height right after getUserMedia(), before the first frame has arrived, when they can still
+          // describe the sensor's landscape format instead of the rotated portrait frames. So getUserMedia() resolves only
+          // once the first video frame is there (max 1.5 s). Set to false to turn this off again.
+          var FIX_VIDEO_FIRST_FRAME = true;
+          var capturedTracks = [];
+
+          // If the track still reports the sensor's landscape size while the real frames are portrait (or the other way
+          // round), report the real size, so Teams sizes its video pipeline and canvases correctly.
+          function correctSettings(track, w, h) {
+            var original = track.getSettings.bind(track);
+            track.getSettings = function () {
+              var s = original();
+              try {
+                if (s && s.width && s.height && ((s.width > s.height) !== (w > h))) {
+                  s.width = w;
+                  s.height = h;
+                  if ('aspectRatio' in s) s.aspectRatio = w / h;
+                }
+              } catch (e) {}
+              return s;
+            };
+          }
+
+          function waitForFirstFrame(stream) {
+            return new Promise(function (resolve) {
+              var videoTrack = stream.getVideoTracks && stream.getVideoTracks()[0];
+              if (!videoTrack) { resolve(stream); return; }
+              var done = false;
+              var probe = document.createElement('video');
+              function finish() {
+                if (done) return;
+                done = true;
+                try {
+                  var w = probe.videoWidth, h = probe.videoHeight;
+                  if (w && h) correctSettings(videoTrack, w, h);
+                } catch (e) {}
+                try { probe.pause(); probe.srcObject = null; } catch (e) {}
+                resolve(stream);
+              }
+              try {
+                probe.muted = true;
+                probe.playsInline = true;
+                probe.addEventListener('loadeddata', finish);
+                probe.addEventListener('resize', finish);
+                probe.srcObject = new MediaStream([videoTrack]);
+                var p = probe.play();
+                if (p && p.catch) p.catch(function () {});
+              } catch (e) { finish(); return; }
+              setTimeout(finish, 1500);
+            });
+          }
+
+          try {
+            var MDP = window.MediaDevices && window.MediaDevices.prototype;
+            if (MDP && MDP.getUserMedia) {
+              var originalGetUserMedia = MDP.getUserMedia;
+              MDP.getUserMedia = function () {
+                return originalGetUserMedia.apply(this, arguments).then(function (stream) {
+                  try { stream.getTracks().forEach(function (t) { capturedTracks.push(t); }); } catch (e) {}
+                  return FIX_VIDEO_FIRST_FRAME ? waitForFirstFrame(stream) : stream;
                 });
               };
             }
@@ -123,12 +206,284 @@ jobs:
             };
             Object.defineProperty(Navigator.prototype, 'userAgentData', { get: function () { return uad; }, configurable: true });
           } catch (e) {}
+
+          if (!IS_TEAMS) return;
+
+          // Notifications: Android WebView has no Notification API (and no push). Teams calls "new Notification(...)" while
+          // the page is hidden; hand those to the Android app, which shows a real notification.
+          try {
+            var FakeNotification = function (title, options) {
+              options = options || {};
+              this.title = String(title || '');
+              this.body = String(options.body || '');
+              this.tag = String(options.tag || '');
+              this.data = options.data;
+              this.onclick = null; this.onclose = null; this.onerror = null; this.onshow = null;
+              post({ type: 'notify', title: this.title, body: this.body, tag: this.tag });
+              var self = this;
+              setTimeout(function () { if (typeof self.onshow === 'function') { try { self.onshow({}); } catch (e) {} } }, 0);
+            };
+            FakeNotification.prototype.close = function () {};
+            FakeNotification.prototype.addEventListener = function () {};
+            FakeNotification.prototype.removeEventListener = function () {};
+            FakeNotification.prototype.dispatchEvent = function () { return true; };
+            Object.defineProperty(FakeNotification, 'permission', { get: function () { return 'granted'; } });
+            FakeNotification.requestPermission = function (callback) {
+              if (typeof callback === 'function') callback('granted');
+              return Promise.resolve('granted');
+            };
+            FakeNotification.maxActions = 0;
+            window.Notification = FakeNotification;
+          } catch (e) {}
+
+          // Calls: tell the Android app when a call is active (microphone/camera captured, or remote media playing), so it
+          // can keep the call alive in the background (foreground service). Going inactive is reported after 8 s of silence.
+          if (IS_TOP) {
+            var callActive = false;
+            var inactiveSince = 0;
+
+            var captureLive = function () {
+              capturedTracks = capturedTracks.filter(function (t) { return t.readyState === 'live'; });
+              return capturedTracks.length > 0;
+            };
+            var remoteMediaPlaying = function () {
+              var els = document.querySelectorAll('audio,video');
+              for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (el.srcObject && typeof el.srcObject.getTracks === 'function' && !el.paused && !el.ended) return true;
+              }
+              return false;
+            };
+
+            setInterval(function () {
+              var active = captureLive() || remoteMediaPlaying();
+              var now = Date.now();
+              if (active) {
+                inactiveSince = 0;
+                if (!callActive) { callActive = true; post({ type: 'call', active: true }); }
+              } else if (callActive) {
+                if (!inactiveSince) inactiveSince = now;
+                if (now - inactiveSince > 8000) { callActive = false; post({ type: 'call', active: false }); }
+              }
+            }, 2000);
+          }
         })();
         JSEOF
 
         GRADLE=android/app/build.gradle
         sed -i '0,/^dependencies {/s//dependencies {\n    implementation "androidx.webkit:webkit:1.12.1"/' "$GRADLE"
         grep -n "androidx.webkit" "$GRADLE" || { echo "Could not add androidx.webkit dependency"; exit 1; }
+
+    - name: Add Foreground Service Java Code
+      run: |
+        cat << 'SVCEOF' > android/app/src/main/java/com/custom/teamsdesktop/TeamsForegroundService.java
+        package com.custom.teamsdesktop;
+
+        import android.Manifest;
+        import android.annotation.SuppressLint;
+        import android.app.Notification;
+        import android.app.NotificationChannel;
+        import android.app.NotificationManager;
+        import android.app.PendingIntent;
+        import android.app.Service;
+        import android.content.Context;
+        import android.content.Intent;
+        import android.content.pm.PackageManager;
+        import android.content.pm.ServiceInfo;
+        import android.os.Build;
+        import android.os.IBinder;
+        import android.os.PowerManager;
+        import androidx.core.app.NotificationCompat;
+        import androidx.core.app.NotificationManagerCompat;
+        import androidx.core.content.ContextCompat;
+
+        /**
+         * Keeps the app process (and with it the Teams web page) alive while the app is in the background, so messages
+         * arrive and calls continue. During a call it also declares the microphone/camera foreground service types, which
+         * Android requires for capturing audio/video in the background.
+         */
+        public class TeamsForegroundService extends Service {
+            static final String ACTION_START = "com.custom.teamsdesktop.action.START";
+            static final String ACTION_CALL_ON = "com.custom.teamsdesktop.action.CALL_ON";
+            static final String ACTION_CALL_OFF = "com.custom.teamsdesktop.action.CALL_OFF";
+            static final String ACTION_QUIT = "com.custom.teamsdesktop.action.QUIT";
+
+            private static final String CHANNEL_BACKGROUND = "teams_background";
+            private static final String CHANNEL_MESSAGES = "teams_messages";
+            private static final int NOTIFICATION_ID = 1001;
+
+            // Set by MainActivity: keep the service running even when there is no call
+            static volatile boolean keepAlive = true;
+
+            private boolean inCall = false;
+            private PowerManager.WakeLock wakeLock = null;
+
+            static void send(Context context, String action) {
+                try {
+                    Intent intent = new Intent(context, TeamsForegroundService.class).setAction(action);
+                    ContextCompat.startForegroundService(context, intent);
+                } catch (Throwable ignored) {
+                    // Android refuses to start it right now (for example the app is in the background): keep the current state
+                }
+            }
+
+            static int immutableFlag() {
+                return Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0;
+            }
+
+            static Intent openIntent(Context context) {
+                return new Intent(context, MainActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            }
+
+            static void ensureChannel(Context context, String id, String name, int importance) {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                    if (nm != null && nm.getNotificationChannel(id) == null) {
+                        nm.createNotificationChannel(new NotificationChannel(id, name, importance));
+                    }
+                }
+            }
+
+            /** Shows a message notification (called from MainActivity while the app is not in the foreground). */
+            @SuppressLint("MissingPermission")
+            static void showMessage(Context context, String title, String body, String tag) {
+                try {
+                    if (Build.VERSION.SDK_INT >= 33
+                            && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                        return;
+                    }
+                    ensureChannel(context, CHANNEL_MESSAGES, "Messages and meetings", NotificationManager.IMPORTANCE_HIGH);
+                    PendingIntent open = PendingIntent.getActivity(context, 2, openIntent(context),
+                        immutableFlag() | PendingIntent.FLAG_UPDATE_CURRENT);
+                    String key = (tag != null && !tag.isEmpty()) ? tag : title;
+                    int id = 2000 + Math.abs(key.hashCode() % 1000);
+                    Notification notification = new NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                        .setSmallIcon(android.R.drawable.stat_notify_chat)
+                        .setContentTitle(title.isEmpty() ? "Teams" : title)
+                        .setContentText(body)
+                        .setStyle(new NotificationCompat.BigTextStyle().bigText(body))
+                        .setContentIntent(open)
+                        .setAutoCancel(true)
+                        .setPriority(NotificationCompat.PRIORITY_HIGH)
+                        .build();
+                    NotificationManagerCompat.from(context).notify(id, notification);
+                } catch (Throwable ignored) {
+                    // notifications are best-effort
+                }
+            }
+
+            @Override
+            public IBinder onBind(Intent intent) {
+                return null;
+            }
+
+            @Override
+            public int onStartCommand(Intent intent, int flags, int startId) {
+                String action = intent != null ? intent.getAction() : null;
+                if (ACTION_CALL_ON.equals(action)) inCall = true;
+                else if (ACTION_CALL_OFF.equals(action)) inCall = false;
+
+                // startForeground() must follow every startForegroundService(), even if we stop again right after
+                boolean promoted = promote();
+                if (!promoted || (!keepAlive && !inCall)) {
+                    releaseWakeLock();
+                    stopForeground(true);
+                    stopSelf();
+                    return START_NOT_STICKY;
+                }
+                updateWakeLock();
+                return START_NOT_STICKY;
+            }
+
+            @Override
+            public void onDestroy() {
+                releaseWakeLock();
+                super.onDestroy();
+            }
+
+            private boolean has(String permission) {
+                return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED;
+            }
+
+            private boolean startAs(Notification notification, int type) {
+                try {
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        startForeground(NOTIFICATION_ID, notification, type);
+                    } else {
+                        startForeground(NOTIFICATION_ID, notification);
+                    }
+                    return true;
+                } catch (RuntimeException e) {
+                    return false;
+                }
+            }
+
+            private boolean promote() {
+                Notification notification = buildNotification();
+                int baseType = 0;
+                if (Build.VERSION.SDK_INT >= 34) {
+                    baseType = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
+                } else if (Build.VERSION.SDK_INT >= 29) {
+                    baseType = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+                }
+                if (inCall && Build.VERSION.SDK_INT >= 30) {
+                    int callType = baseType;
+                    if (has(Manifest.permission.RECORD_AUDIO)) callType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+                    if (has(Manifest.permission.CAMERA)) callType |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
+                    if (startAs(notification, callType)) return true;
+                    // Android only allows these types while the app is visible; fall back to the plain background type
+                }
+                return startAs(notification, baseType);
+            }
+
+            private Notification buildNotification() {
+                ensureChannel(this, CHANNEL_BACKGROUND, "Background connection", NotificationManager.IMPORTANCE_LOW);
+                PendingIntent open = PendingIntent.getActivity(this, 0, openIntent(this),
+                    immutableFlag() | PendingIntent.FLAG_UPDATE_CURRENT);
+                Intent quitIntent = new Intent(this, MainActivity.class).setAction(ACTION_QUIT)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                PendingIntent quit = PendingIntent.getActivity(this, 1, quitIntent,
+                    immutableFlag() | PendingIntent.FLAG_UPDATE_CURRENT);
+                return new NotificationCompat.Builder(this, CHANNEL_BACKGROUND)
+                    .setSmallIcon(inCall ? android.R.drawable.stat_sys_phone_call : android.R.drawable.stat_notify_chat)
+                    .setContentTitle(inCall ? "Teams call in progress" : "Teams is running")
+                    .setContentText(inCall ? "Tap to return to the call" : "Keeping your session alive for messages and calls")
+                    .setContentIntent(open)
+                    .addAction(0, "Quit", quit)
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                    .setCategory(inCall ? NotificationCompat.CATEGORY_CALL : NotificationCompat.CATEGORY_SERVICE)
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .build();
+            }
+
+            private void updateWakeLock() {
+                try {
+                    if (inCall) {
+                        if (wakeLock == null) {
+                            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "teamsdesktop:call");
+                            wakeLock.setReferenceCounted(false);
+                        }
+                        if (!wakeLock.isHeld()) wakeLock.acquire(4 * 60 * 60 * 1000L);
+                    } else {
+                        releaseWakeLock();
+                    }
+                } catch (Throwable ignored) {
+                    // the call still works, the CPU may just sleep when the screen is off
+                }
+            }
+
+            private void releaseWakeLock() {
+                try {
+                    if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                } catch (Throwable ignored) {
+                    // nothing to release
+                }
+            }
+        }
+        SVCEOF
 
     - name: Inject Custom MainActivity Java Code
       run: |
@@ -141,11 +496,13 @@ jobs:
         import android.os.Build;
         import android.os.Bundle;
         import android.os.Handler;
+        import android.content.Intent;
         import android.graphics.Bitmap;
         import android.net.Uri;
         import android.net.http.SslCertificate;
         import android.net.http.SslError;
         import android.os.Looper;
+        import android.os.Message;
         import android.view.View;
         import android.view.WindowManager;
         import android.webkit.CookieManager;
@@ -158,10 +515,14 @@ jobs:
         import android.webkit.WebResourceResponse;
         import android.webkit.WebSettings;
         import android.webkit.WebView;
+        import android.webkit.WebViewClient;
+        import android.widget.Toast;
         import androidx.activity.OnBackPressedCallback;
         import androidx.core.app.ActivityCompat;
         import androidx.core.content.ContextCompat;
+        import androidx.webkit.JavaScriptReplyProxy;
         import androidx.webkit.UserAgentMetadata;
+        import androidx.webkit.WebMessageCompat;
         import androidx.webkit.WebSettingsCompat;
         import androidx.webkit.WebViewCompat;
         import androidx.webkit.WebViewFeature;
@@ -173,14 +534,26 @@ jobs:
         import java.util.ArrayList;
         import java.util.Arrays;
         import java.util.Collections;
+        import java.util.HashSet;
         import java.util.List;
+        import java.util.Set;
         import java.util.regex.Matcher;
         import java.util.regex.Pattern;
+        import org.json.JSONObject;
         import java.util.List;
 
         public class MainActivity extends BridgeActivity {
             private static final int MEDIA_PERMISSION_REQUEST = 4242;
             private boolean permissionRequestInFlight = false;
+
+            // Keep the app process (and the Teams page) alive in the background so messages and calls keep working.
+            // Costs some battery and shows a permanent notification with a Quit button. Set to false to only keep calls alive.
+            private static final boolean KEEP_ALIVE_IN_BACKGROUND = true;
+            private boolean inForeground = false;
+
+            // CSS "zoom" on the Teams page made the layout compact, but it also breaks touch input inside embedded frames
+            // (invitation bodies could not be tapped) and distorts video in portrait. false = no zoom, true = old compact look.
+            private static final boolean COMPACT_ZOOM = false;
 
             // Closes the top-most dialog/panel in Teams by sending Escape. Returns true if one was found.
             // If the same element is still there on the next press we let Back do something else (no trap).
@@ -273,6 +646,42 @@ jobs:
                                 super.onPermissionRequest(request); // Capacitor's own prompt flow
                             }
                         }
+
+                        @Override
+                        public boolean onCreateWindow(final WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+                            // Links that open a new window (target=_blank, window.open): route them instead of dropping them
+                            final WebView popup = new WebView(view.getContext());
+                            popup.setWebViewClient(new WebViewClient() {
+                                private boolean handled = false;
+
+                                private void handle(String url) {
+                                    if (handled || url == null || url.equals("about:blank")) return;
+                                    handled = true;
+                                    routeLink(view, url);
+                                    view.post(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            popup.destroy();
+                                        }
+                                    });
+                                }
+
+                                @Override
+                                public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
+                                    handle(request.getUrl().toString());
+                                    return true;
+                                }
+
+                                @Override
+                                public void onPageStarted(WebView v, String url, Bitmap favicon) {
+                                    handle(url);
+                                }
+                            });
+                            WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+                            transport.setWebView(popup);
+                            resultMsg.sendToTarget();
+                            return true;
+                        }
                     });
                 } catch (Throwable ignored) {
                     // fall back to Capacitor's default WebChromeClient
@@ -335,6 +744,11 @@ jobs:
                             boolean redirect = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && request.isRedirect();
                             trail((redirect ? "redirect " : "navigate ") + (request.isForMainFrame() ? "" : "(subframe) ")
                                 + stripQuery(request.getUrl().toString()));
+                            // Links in invitations/mails are often wrapped in Safe Links: open the real target (in the app if it is Microsoft)
+                            if (request.isForMainFrame() && !redirect && isSafeLink(request.getUrl().toString())) {
+                                routeLink(view, request.getUrl().toString());
+                                return true;
+                            }
                             // Never abort a server redirect of the main page (sign-in chains)
                             if (request.isForMainFrame() && redirect) return false;
                             return super.shouldOverrideUrlLoading(view, request);
@@ -504,6 +918,13 @@ jobs:
             public void onCreate(Bundle savedInstanceState) {
                 super.onCreate(savedInstanceState);
 
+                // "Quit" button of the background notification
+                if (getIntent() != null && TeamsForegroundService.ACTION_QUIT.equals(getIntent().getAction())) {
+                    stopService(new Intent(this, TeamsForegroundService.class));
+                    finishAndRemoveTask();
+                    return;
+                }
+
                 // Android Back: close dialogs / go back in Teams instead of closing the app
                 getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
                     @Override
@@ -522,19 +943,21 @@ jobs:
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !has(Manifest.permission.BLUETOOTH_CONNECT)) {
                     missing.add(Manifest.permission.BLUETOOTH_CONNECT);
                 }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !has(Manifest.permission.POST_NOTIFICATIONS)) {
+                    missing.add(Manifest.permission.POST_NOTIFICATIONS);
+                }
                 if (!missing.isEmpty()) {
                     permissionRequestInFlight = true;
                     ActivityCompat.requestPermissions(this, missing.toArray(new String[0]), MEDIA_PERMISSION_REQUEST);
                 }
 
-                // TEMPORARY: lets chrome://inspect show the real network error and request headers. Remove when fixed.
-                WebView.setWebContentsDebuggingEnabled(true);
-
                 installMediaPermissionClient();
                 installNavigationClient();
                 setDesktopIdentity();
                 installPageHooks();
+                installNativeBridge();
                 restartStartPage();
+                startBackgroundService();
 
                 this.bridge.getWebView().post(new Runnable() {
                     @Override
@@ -544,6 +967,7 @@ jobs:
 
                         settings.setJavaScriptEnabled(true);
                         settings.setDomStorageEnabled(true);
+                        settings.setSupportMultipleWindows(true); // links that open a new window are routed by onCreateWindow
                         settings.setDatabaseEnabled(true);
                         settings.setSavePassword(true);
                         settings.setSaveFormData(true);
@@ -571,7 +995,7 @@ jobs:
                             "  style.id = id;" +
                             "  style.type = 'text/css';" +
                             "  style.innerHTML = '" +
-                            "    body, html, #app-container, .app-width, #main-layout-id { zoom: 0.85 !important; }" +
+                            (COMPACT_ZOOM ? "    body, html, #app-container, .app-width, #main-layout-id { zoom: 0.85 !important; }" : "") +
                             "    .v2-left-rail, [data-test-id=\"left-rail\"], div[class*=\"leftRail\"] {" +
                             "      width: 50px !important; min-width: 50px !important;" +
                             "    }" +
@@ -607,6 +1031,112 @@ jobs:
                 });
             }
 
+            // ---- Links, native bridge (notifications / calls) ------------------------------------------------------
+
+            private static boolean isMicrosoftHost(String host) {
+                if (host == null) return false;
+                String h = host.toLowerCase();
+                String[] suffixes = {
+                    "microsoft.com", "microsoft", "microsoftonline.com", "office.com", "office365.com", "live.com",
+                    "skype.com", "sharepoint.com", "microsoft365.com", "cloud.microsoft", "msauth.net", "msftauth.net"
+                };
+                for (String s : suffixes) {
+                    if (h.equals(s) || h.endsWith("." + s)) return true;
+                }
+                return false;
+            }
+
+            private static boolean isSafeLink(String url) {
+                try {
+                    String host = Uri.parse(url).getHost();
+                    return host != null && host.toLowerCase().endsWith("safelinks.protection.outlook.com");
+                } catch (Exception e) {
+                    return false;
+                }
+            }
+
+            private static String unwrapSafeLink(String url) {
+                try {
+                    if (isSafeLink(url)) {
+                        String real = Uri.parse(url).getQueryParameter("url");
+                        if (real != null && !real.isEmpty()) return real;
+                    }
+                } catch (Exception ignored) {
+                    // use the link as it is
+                }
+                return url;
+            }
+
+            private void openExternally(String url) {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                } catch (Exception e) {
+                    Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            // Microsoft pages (Teams, live events, meeting joins) open inside the app, everything else in the browser.
+            private void routeLink(WebView main, String url) {
+                String target = unwrapSafeLink(url);
+                Uri uri = Uri.parse(target);
+                String scheme = uri.getScheme();
+                boolean web = "https".equals(scheme) || "http".equals(scheme);
+                if (web && isMicrosoftHost(uri.getHost())) {
+                    main.loadUrl(target);
+                } else {
+                    openExternally(target);
+                }
+            }
+
+            // Lets the Teams page (only the Teams origins) talk to the app: call state and notifications.
+            private void installNativeBridge() {
+                try {
+                    if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return;
+                    Set<String> origins = new HashSet<>(Arrays.asList("https://teams.cloud.microsoft", "https://teams.microsoft.com"));
+                    WebViewCompat.addWebMessageListener(bridge.getWebView(), "TeamsNative", origins,
+                        new WebViewCompat.WebMessageListener() {
+                            @Override
+                            public void onPostMessage(WebView view, WebMessageCompat message, Uri sourceOrigin,
+                                                      boolean isMainFrame, JavaScriptReplyProxy replyProxy) {
+                                handleNativeMessage(message.getData());
+                            }
+                        });
+                } catch (Throwable ignored) {
+                    // calls and notifications then simply behave like before
+                }
+            }
+
+            private void handleNativeMessage(String data) {
+                if (data == null) return;
+                try {
+                    JSONObject message = new JSONObject(data);
+                    String type = message.optString("type");
+                    if ("call".equals(type)) {
+                        TeamsForegroundService.send(this, message.optBoolean("active")
+                            ? TeamsForegroundService.ACTION_CALL_ON : TeamsForegroundService.ACTION_CALL_OFF);
+                    } else if ("notify".equals(type) && !inForeground) {
+                        TeamsForegroundService.showMessage(this, message.optString("title"), message.optString("body"), message.optString("tag"));
+                    }
+                } catch (Exception ignored) {
+                    // malformed message
+                }
+            }
+
+            private void startBackgroundService() {
+                try {
+                    TeamsForegroundService.keepAlive = KEEP_ALIVE_IN_BACKGROUND;
+                    if (KEEP_ALIVE_IN_BACKGROUND) {
+                        TeamsForegroundService.send(this, TeamsForegroundService.ACTION_START);
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        // keep the page's renderer at full priority while the app is in the background
+                        bridge.getWebView().setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+                    }
+                } catch (Throwable ignored) {
+                    // background mode is best-effort
+                }
+            }
+
             @Override
             public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
                 super.onRequestPermissionsResult(requestCode, permissions, grantResults);
@@ -620,9 +1150,33 @@ jobs:
             }
 
             @Override
+            public void onResume() {
+                super.onResume();
+                inForeground = true;
+            }
+
+            @Override
             public void onPause() {
                 super.onPause();
+                inForeground = false;
                 CookieManager.getInstance().flush();
+            }
+
+            @Override
+            public void onNewIntent(Intent intent) {
+                super.onNewIntent(intent);
+                if (intent != null && TeamsForegroundService.ACTION_QUIT.equals(intent.getAction())) {
+                    stopService(new Intent(this, TeamsForegroundService.class));
+                    finishAndRemoveTask();
+                }
+            }
+
+            @Override
+            public void onDestroy() {
+                super.onDestroy();
+                if (isFinishing()) {
+                    stopService(new Intent(this, TeamsForegroundService.class));
+                }
             }
 
             @Override

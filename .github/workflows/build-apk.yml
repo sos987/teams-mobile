@@ -124,56 +124,94 @@ jobs:
             }
           } catch (e) {}
 
-          // Camera: the preview and the self-view are stretched in WebView. A likely reason is that Teams reads the
-          // track's width/height right after getUserMedia(), before the first frame has arrived, when they can still
-          // describe the sensor's landscape format instead of the rotated portrait frames. So getUserMedia() resolves only
-          // once the first video frame is there (max 1.5 s). Set to false to turn this off again.
-          var FIX_VIDEO_FIRST_FRAME = true;
+          // Camera in portrait: Teams shows the self-view and sends the video in a fixed 16:9 box, but in portrait the phone's
+          // camera delivers portrait frames, which end up stretched. So in portrait the camera picture is drawn into a 16:9
+          // canvas and that stream is handed to Teams instead (the picture keeps its proportions; 'contain' = whole picture
+          // with black side bars, 'cover' = fills the box and crops top and bottom). Landscape is left untouched.
+          // Set FIX_PORTRAIT_VIDEO to false to turn this off again.
+          var FIX_PORTRAIT_VIDEO = true;
+          var VIDEO_FIT = 'contain';
+          var OUT_W = 1280, OUT_H = 720;
           var capturedTracks = [];
 
-          // If the track still reports the sensor's landscape size while the real frames are portrait (or the other way
-          // round), report the real size, so Teams sizes its video pipeline and canvases correctly.
-          function correctSettings(track, w, h) {
-            var original = track.getSettings.bind(track);
-            track.getSettings = function () {
-              var s = original();
-              try {
-                if (s && s.width && s.height && ((s.width > s.height) !== (w > h))) {
-                  s.width = w;
-                  s.height = h;
-                  if ('aspectRatio' in s) s.aspectRatio = w / h;
-                }
-              } catch (e) {}
-              return s;
-            };
+          function isPortrait() {
+            try { return window.matchMedia('(orientation: portrait)').matches; } catch (e) { return false; }
           }
 
-          function waitForFirstFrame(stream) {
+          function letterboxStream(stream) {
             return new Promise(function (resolve) {
-              var videoTrack = stream.getVideoTracks && stream.getVideoTracks()[0];
-              if (!videoTrack) { resolve(stream); return; }
-              var done = false;
-              var probe = document.createElement('video');
-              function finish() {
-                if (done) return;
-                done = true;
-                try {
-                  var w = probe.videoWidth, h = probe.videoHeight;
-                  if (w && h) correctSettings(videoTrack, w, h);
-                } catch (e) {}
-                try { probe.pause(); probe.srcObject = null; } catch (e) {}
+              var origTrack = stream.getVideoTracks && stream.getVideoTracks()[0];
+              if (!origTrack || !FIX_PORTRAIT_VIDEO || !isPortrait() ||
+                  !window.HTMLCanvasElement || !window.HTMLCanvasElement.prototype.captureStream) {
                 resolve(stream);
+                return;
               }
+              var source, canvas, ctx, outTrack, timer = 0, settled = false;
+
+              function draw() {
+                var w = source.videoWidth, h = source.videoHeight;
+                if (!w || !h) return;
+                var scale = (VIDEO_FIT === 'cover') ? Math.max(OUT_W / w, OUT_H / h) : Math.min(OUT_W / w, OUT_H / h);
+                var dw = w * scale, dh = h * scale;
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0, 0, OUT_W, OUT_H);
+                ctx.drawImage(source, (OUT_W - dw) / 2, (OUT_H - dh) / 2, dw, dh);
+              }
+
+              function ready() {
+                if (settled) return;
+                settled = true;
+                draw();
+                timer = setInterval(draw, 33);
+
+                var stopOut = outTrack.stop.bind(outTrack);
+                var baseSettings = outTrack.getSettings.bind(outTrack);
+                outTrack.stop = function () {
+                  clearInterval(timer);
+                  try { origTrack.stop(); } catch (e) {}
+                  stopOut();
+                };
+                outTrack.getSettings = function () {
+                  var s = {};
+                  try { s = origTrack.getSettings(); } catch (e) {}
+                  var own = baseSettings();
+                  s.width = OUT_W; s.height = OUT_H; s.aspectRatio = OUT_W / OUT_H;
+                  if (own && own.frameRate) s.frameRate = own.frameRate;
+                  return s;
+                };
+                try { Object.defineProperty(outTrack, 'label', { get: function () { return origTrack.label; } }); } catch (e) {}
+                outTrack.getCapabilities = function () { try { return origTrack.getCapabilities(); } catch (e) { return {}; } };
+                outTrack.applyConstraints = function (c) { try { return origTrack.applyConstraints(c); } catch (e) { return Promise.resolve(); } };
+                origTrack.addEventListener('ended', function () {
+                  clearInterval(timer);
+                  try { stopOut(); outTrack.dispatchEvent(new Event('ended')); } catch (e) {}
+                });
+
+                resolve(new MediaStream(stream.getAudioTracks().concat([outTrack])));
+              }
+
               try {
-                probe.muted = true;
-                probe.playsInline = true;
-                probe.addEventListener('loadeddata', finish);
-                probe.addEventListener('resize', finish);
-                probe.srcObject = new MediaStream([videoTrack]);
-                var p = probe.play();
+                source = document.createElement('video');
+                source.muted = true;
+                source.playsInline = true;
+                source.addEventListener('loadeddata', ready);
+                source.addEventListener('resize', ready);
+                source.srcObject = new MediaStream([origTrack]);
+                canvas = document.createElement('canvas');
+                canvas.width = OUT_W;
+                canvas.height = OUT_H;
+                ctx = canvas.getContext('2d');
+                outTrack = canvas.captureStream(30).getVideoTracks()[0];
+                var p = source.play();
                 if (p && p.catch) p.catch(function () {});
-              } catch (e) { finish(); return; }
-              setTimeout(finish, 1500);
+              } catch (e) { settled = true; resolve(stream); return; }
+
+              setTimeout(function () {
+                if (settled) return;
+                settled = true; // no frame in time: hand over the camera as it is
+                try { source.srcObject = null; outTrack.stop(); } catch (e) {}
+                resolve(stream);
+              }, 2000);
             });
           }
 
@@ -183,8 +221,10 @@ jobs:
               var originalGetUserMedia = MDP.getUserMedia;
               MDP.getUserMedia = function () {
                 return originalGetUserMedia.apply(this, arguments).then(function (stream) {
-                  try { stream.getTracks().forEach(function (t) { capturedTracks.push(t); }); } catch (e) {}
-                  return FIX_VIDEO_FIRST_FRAME ? waitForFirstFrame(stream) : stream;
+                  return letterboxStream(stream).then(function (result) {
+                    try { result.getTracks().forEach(function (t) { capturedTracks.push(t); }); } catch (e) {}
+                    return result;
+                  });
                 });
               };
             }
@@ -211,6 +251,16 @@ jobs:
 
           // Notifications: Android WebView has no Notification API (and no push). Teams calls "new Notification(...)" while
           // the page is hidden; hand those to the Android app, which shows a real notification.
+          // DEBUG_NOTIFICATIONS (temporary): shows a short on-screen message in the app for each notification-related thing
+          // Teams does, and sends a test notification 45 s after the page loaded (put the app in the background to see it).
+          var DEBUG_NOTIFICATIONS = true;
+          var debugSeen = {};
+          function debug(text, always) {
+            if (!DEBUG_NOTIFICATIONS) return;
+            if (!always && debugSeen[text]) return;
+            debugSeen[text] = true;
+            post({ type: 'debug', text: text });
+          }
           try {
             var FakeNotification = function (title, options) {
               options = options || {};
@@ -219,6 +269,7 @@ jobs:
               this.tag = String(options.tag || '');
               this.data = options.data;
               this.onclick = null; this.onclose = null; this.onerror = null; this.onshow = null;
+              debug('Notification created: ' + this.title.slice(0, 30), true);
               post({ type: 'notify', title: this.title, body: this.body, tag: this.tag });
               var self = this;
               setTimeout(function () { if (typeof self.onshow === 'function') { try { self.onshow({}); } catch (e) {} } }, 0);
@@ -227,13 +278,21 @@ jobs:
             FakeNotification.prototype.addEventListener = function () {};
             FakeNotification.prototype.removeEventListener = function () {};
             FakeNotification.prototype.dispatchEvent = function () { return true; };
-            Object.defineProperty(FakeNotification, 'permission', { get: function () { return 'granted'; } });
+            Object.defineProperty(FakeNotification, 'permission', {
+              get: function () { debug('Notification.permission was read'); return 'granted'; }
+            });
             FakeNotification.requestPermission = function (callback) {
+              debug('Notification.requestPermission was called');
               if (typeof callback === 'function') callback('granted');
               return Promise.resolve('granted');
             };
             FakeNotification.maxActions = 0;
             window.Notification = FakeNotification;
+            if (DEBUG_NOTIFICATIONS && IS_TOP) {
+              setTimeout(function () {
+                new FakeNotification('Test notification', { body: 'If you can read this in the notification shade, the Android side works.', tag: 'test' });
+              }, 45000);
+            }
           } catch (e) {}
 
           // Calls: tell the Android app when a call is active (microphone/camera captured, or remote media playing), so it
@@ -1114,6 +1173,8 @@ jobs:
                     if ("call".equals(type)) {
                         TeamsForegroundService.send(this, message.optBoolean("active")
                             ? TeamsForegroundService.ACTION_CALL_ON : TeamsForegroundService.ACTION_CALL_OFF);
+                    } else if ("debug".equals(type)) {
+                        Toast.makeText(this, "Teams: " + message.optString("text"), Toast.LENGTH_SHORT).show();
                     } else if ("notify".equals(type) && !inForeground) {
                         TeamsForegroundService.showMessage(this, message.optString("title"), message.optString("body"), message.optString("tag"));
                     }

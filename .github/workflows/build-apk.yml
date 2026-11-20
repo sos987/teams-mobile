@@ -252,7 +252,7 @@ jobs:
           // Notifications: Android WebView has no Notification API (and no push). Teams calls "new Notification(...)" while
           // the page is hidden; hand those to the Android app, which shows a real notification.
           // DEBUG_NOTIFICATIONS (temporary): shows a short on-screen message in the app for each notification-related thing
-          // Teams does, and sends a test notification 45 s after the page loaded (put the app in the background to see it).
+          // Teams does.
           var DEBUG_NOTIFICATIONS = true;
           var debugSeen = {};
           function debug(text, always) {
@@ -288,12 +288,49 @@ jobs:
             };
             FakeNotification.maxActions = 0;
             window.Notification = FakeNotification;
-            if (DEBUG_NOTIFICATIONS && IS_TOP) {
-              setTimeout(function () {
-                new FakeNotification('Test notification', { body: 'If you can read this in the notification shade, the Android side works.', tag: 'test' });
-              }, 45000);
-            }
           } catch (e) {}
+
+          // Teams does not create browser notifications in this WebView (it only checks the permission), but it keeps the unread
+          // count in the page title up to date, e.g. "(2) Chat | Microsoft Teams". When that count grows, show a notification
+          // (with the text of Teams' own in-page banner when there is one).
+          if (IS_TOP) {
+            var lastUnread = null;
+            var unreadOf = function (title) {
+              var m = /^\s*\((\d+)\+?\)/.exec(title) || /\((\d+)\+?\)/.exec(title);
+              return m ? parseInt(m[1], 10) : 0;
+            };
+            var describeActivity = function () {
+              try {
+                var nodes = document.querySelectorAll('[role="alert"],[data-tid*="toast"],[data-tid*="notification"]');
+                for (var i = 0; i < nodes.length; i++) {
+                  var text = (nodes[i].innerText || '').replace(/\s+/g, ' ').trim();
+                  if (text.length > 3) return text.slice(0, 160);
+                }
+              } catch (e) {}
+              return '';
+            };
+            var onTitleChange = function () {
+              var title = document.title || '';
+              var unread = unreadOf(title);
+              if (/\(\d+\+?\)/.test(title)) debug('title: ' + title.slice(0, 40));
+              if (lastUnread !== null && unread > lastUnread) {
+                var detail = describeActivity();
+                debug('unread ' + lastUnread + ' -> ' + unread + (detail ? ': ' + detail.slice(0, 40) : ''), true);
+                post({ type: 'notify', title: 'Microsoft Teams', body: detail || (unread + ' unread'), tag: 'unread' });
+              }
+              lastUnread = unread;
+            };
+            var watchTitle = function () {
+              var el = document.querySelector('title');
+              if (!el) { setTimeout(watchTitle, 1000); return; }
+              onTitleChange();
+              new MutationObserver(onTitleChange).observe(el, { childList: true, characterData: true, subtree: true });
+            };
+            watchTitle();
+            document.addEventListener('visibilitychange', function () {
+              debug('page is ' + document.visibilityState + ', focus: ' + document.hasFocus(), true);
+            });
+          }
 
           // Calls: tell the Android app when a call is active (microphone/camera captured, or remote media playing), so it
           // can keep the call alive in the background (foreground service). Going inactive is reported after 8 s of silence.

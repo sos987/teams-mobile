@@ -251,16 +251,6 @@ jobs:
 
           // Notifications: Android WebView has no Notification API (and no push). Teams calls "new Notification(...)" while
           // the page is hidden; hand those to the Android app, which shows a real notification.
-          // DEBUG_NOTIFICATIONS (temporary): shows a short on-screen message in the app for each notification-related thing
-          // Teams does.
-          var DEBUG_NOTIFICATIONS = true;
-          var debugSeen = {};
-          function debug(text, always) {
-            if (!DEBUG_NOTIFICATIONS) return;
-            if (!always && debugSeen[text]) return;
-            debugSeen[text] = true;
-            post({ type: 'debug', text: text });
-          }
           try {
             var FakeNotification = function (title, options) {
               options = options || {};
@@ -269,7 +259,6 @@ jobs:
               this.tag = String(options.tag || '');
               this.data = options.data;
               this.onclick = null; this.onclose = null; this.onerror = null; this.onshow = null;
-              debug('Notification created: ' + this.title.slice(0, 30), true);
               post({ type: 'notify', title: this.title, body: this.body, tag: this.tag });
               var self = this;
               setTimeout(function () { if (typeof self.onshow === 'function') { try { self.onshow({}); } catch (e) {} } }, 0);
@@ -279,10 +268,9 @@ jobs:
             FakeNotification.prototype.removeEventListener = function () {};
             FakeNotification.prototype.dispatchEvent = function () { return true; };
             Object.defineProperty(FakeNotification, 'permission', {
-              get: function () { debug('Notification.permission was read'); return 'granted'; }
+              get: function () { return 'granted'; }
             });
             FakeNotification.requestPermission = function (callback) {
-              debug('Notification.requestPermission was called');
               if (typeof callback === 'function') callback('granted');
               return Promise.resolve('granted');
             };
@@ -312,10 +300,8 @@ jobs:
             var onTitleChange = function () {
               var title = document.title || '';
               var unread = unreadOf(title);
-              if (/\(\d+\+?\)/.test(title)) debug('title: ' + title.slice(0, 40));
               if (lastUnread !== null && unread > lastUnread) {
                 var detail = describeActivity();
-                debug('unread ' + lastUnread + ' -> ' + unread + (detail ? ': ' + detail.slice(0, 40) : ''), true);
                 post({ type: 'notify', title: 'Microsoft Teams', body: detail || (unread + ' unread'), tag: 'unread' });
               }
               lastUnread = unread;
@@ -327,9 +313,6 @@ jobs:
               new MutationObserver(onTitleChange).observe(el, { childList: true, characterData: true, subtree: true });
             };
             watchTitle();
-            document.addEventListener('visibilitychange', function () {
-              debug('page is ' + document.visibilityState + ', focus: ' + document.hasFocus(), true);
-            });
           }
 
           // Calls: tell the Android app when a call is active (microphone/camera captured, or remote media playing), so it
@@ -1210,8 +1193,6 @@ jobs:
                     if ("call".equals(type)) {
                         TeamsForegroundService.send(this, message.optBoolean("active")
                             ? TeamsForegroundService.ACTION_CALL_ON : TeamsForegroundService.ACTION_CALL_OFF);
-                    } else if ("debug".equals(type)) {
-                        Toast.makeText(this, "Teams: " + message.optString("text"), Toast.LENGTH_SHORT).show();
                     } else if ("notify".equals(type) && !inForeground) {
                         TeamsForegroundService.showMessage(this, message.optString("title"), message.optString("body"), message.optString("tag"));
                     }
